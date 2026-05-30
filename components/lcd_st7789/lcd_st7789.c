@@ -1,206 +1,152 @@
 #include "lcd_st7789.h"
 
-#include <ctype.h>
-#include <string.h>
+#include <assert.h>
 
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lvgl.h"
 
 #define LCD_HOST SPI2_HOST
 #define LCD_SPI_CLOCK_HZ (40 * 1000 * 1000)
+#define LCD_CMD_BITS 8
+#define LCD_PARAM_BITS 8
+#define LVGL_TICK_PERIOD_MS 2
+#define LVGL_BUFFER_LINES 20
 
 static const char *TAG = "lcd_st7789";
-static spi_device_handle_t s_lcd_spi;
+static lv_disp_draw_buf_t s_disp_buf;
+static lv_disp_drv_t s_disp_drv;
 
-static esp_err_t lcd_write(const uint8_t *data, int len, int dc_level)
+static bool lcd_flush_ready(esp_lcd_panel_io_handle_t panel_io,
+                            esp_lcd_panel_io_event_data_t *edata,
+                            void *user_ctx)
 {
-    if (len == 0) {
-        return ESP_OK;
-    }
-
-    spi_transaction_t trans = {
-        .length = len * 8,
-        .tx_buffer = data,
-    };
-    gpio_set_level(LCD_ST7789_PIN_DC, dc_level);
-    return spi_device_polling_transmit(s_lcd_spi, &trans);
+    lv_disp_drv_t *disp_drv = (lv_disp_drv_t *)user_ctx;
+    lv_disp_flush_ready(disp_drv);
+    return false;
 }
 
-static esp_err_t lcd_cmd(uint8_t cmd)
+static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
-    return lcd_write(&cmd, 1, 0);
+    esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
+    esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_map);
 }
 
-static esp_err_t lcd_data(const uint8_t *data, int len)
+static void lvgl_tick_cb(void *arg)
 {
-    return lcd_write(data, len, 1);
+    lv_tick_inc(LVGL_TICK_PERIOD_MS);
 }
 
-static esp_err_t lcd_cmd_data(uint8_t cmd, const uint8_t *data, int len)
+static void lvgl_task(void *arg)
 {
-    ESP_RETURN_ON_ERROR(lcd_cmd(cmd), TAG, "write command failed");
-    return lcd_data(data, len);
-}
-
-static esp_err_t lcd_set_window(int x0, int y0, int x1, int y1)
-{
-    x0 += LCD_ST7789_X_OFFSET;
-    x1 += LCD_ST7789_X_OFFSET;
-    y0 += LCD_ST7789_Y_OFFSET;
-    y1 += LCD_ST7789_Y_OFFSET;
-
-    uint8_t caset[] = {
-        (uint8_t)(x0 >> 8), (uint8_t)x0,
-        (uint8_t)(x1 >> 8), (uint8_t)x1,
-    };
-    uint8_t raset[] = {
-        (uint8_t)(y0 >> 8), (uint8_t)y0,
-        (uint8_t)(y1 >> 8), (uint8_t)y1,
-    };
-
-    ESP_RETURN_ON_ERROR(lcd_cmd_data(0x2A, caset, sizeof(caset)), TAG, "set column failed");
-    ESP_RETURN_ON_ERROR(lcd_cmd_data(0x2B, raset, sizeof(raset)), TAG, "set row failed");
-    return lcd_cmd(0x2C);
-}
-
-static esp_err_t lcd_fill_rect(int x, int y, int w, int h, uint16_t color)
-{
-    if (x >= LCD_ST7789_WIDTH || y >= LCD_ST7789_HEIGHT || w <= 0 || h <= 0) {
-        return ESP_OK;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        lv_timer_handler();
     }
-    if (x < 0) {
-        w += x;
-        x = 0;
-    }
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-    if (x + w > LCD_ST7789_WIDTH) {
-        w = LCD_ST7789_WIDTH - x;
-    }
-    if (y + h > LCD_ST7789_HEIGHT) {
-        h = LCD_ST7789_HEIGHT - y;
-    }
-    if (w <= 0 || h <= 0) {
-        return ESP_OK;
-    }
-
-    ESP_RETURN_ON_ERROR(lcd_set_window(x, y, x + w - 1, y + h - 1), TAG, "set window failed");
-
-    uint8_t line[LCD_ST7789_WIDTH * 2];
-    for (int i = 0; i < w; i++) {
-        line[i * 2] = color >> 8;
-        line[i * 2 + 1] = color & 0xFF;
-    }
-
-    for (int row = 0; row < h; row++) {
-        ESP_RETURN_ON_ERROR(lcd_data(line, w * 2), TAG, "fill row failed");
-    }
-    return ESP_OK;
-}
-
-static void font5x7(char c, uint8_t cols[5])
-{
-    memset(cols, 0, 5);
-    switch ((char)tolower((unsigned char)c)) {
-    case 'd': { const uint8_t v[5] = {0x38, 0x44, 0x44, 0x48, 0x7F}; memcpy(cols, v, 5); break; }
-    case 'e': { const uint8_t v[5] = {0x38, 0x54, 0x54, 0x54, 0x18}; memcpy(cols, v, 5); break; }
-    case 'h': { const uint8_t v[5] = {0x7F, 0x08, 0x04, 0x04, 0x78}; memcpy(cols, v, 5); break; }
-    case 'l': { const uint8_t v[5] = {0x00, 0x41, 0x7F, 0x40, 0x00}; memcpy(cols, v, 5); break; }
-    case 'o': { const uint8_t v[5] = {0x38, 0x44, 0x44, 0x44, 0x38}; memcpy(cols, v, 5); break; }
-    case 'r': { const uint8_t v[5] = {0x7C, 0x08, 0x04, 0x04, 0x08}; memcpy(cols, v, 5); break; }
-    case 'w': { const uint8_t v[5] = {0x1F, 0x20, 0x18, 0x20, 0x1F}; memcpy(cols, v, 5); break; }
-    default:
-        break;
-    }
-}
-
-static esp_err_t lcd_draw_char(int x, int y, char c, uint16_t color, uint16_t bg_color, int scale)
-{
-    uint8_t cols[5];
-    font5x7(c, cols);
-
-    for (int col = 0; col < 6; col++) {
-        uint8_t bits = col < 5 ? cols[col] : 0;
-        for (int row = 0; row < 8; row++) {
-            uint16_t pixel_color = (bits & (1U << row)) ? color : bg_color;
-            ESP_RETURN_ON_ERROR(lcd_fill_rect(x + col * scale, y + row * scale, scale, scale, pixel_color),
-                                TAG, "draw char failed");
-        }
-    }
-    return ESP_OK;
 }
 
 esp_err_t lcd_st7789_init(void)
 {
-    gpio_config_t ctrl_io = {
-        .pin_bit_mask = (1ULL << LCD_ST7789_PIN_DC) |
-                        (1ULL << LCD_ST7789_PIN_RST) |
-                        (1ULL << LCD_ST7789_PIN_BL),
+    gpio_config_t backlight_gpio = {
+        .pin_bit_mask = 1ULL << LCD_ST7789_PIN_BL,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    ESP_RETURN_ON_ERROR(gpio_config(&ctrl_io), TAG, "config gpio failed");
+    ESP_RETURN_ON_ERROR(gpio_config(&backlight_gpio), TAG, "config backlight gpio failed");
+    gpio_set_level(LCD_ST7789_PIN_BL, 0);
 
-    spi_bus_config_t buscfg = {
+    spi_bus_config_t bus_config = {
+        .sclk_io_num = LCD_ST7789_PIN_SCLK,
         .mosi_io_num = LCD_ST7789_PIN_MOSI,
         .miso_io_num = -1,
-        .sclk_io_num = LCD_ST7789_PIN_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_ST7789_WIDTH * 2,
+        .max_transfer_sz = LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t),
     };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO), TAG, "init spi bus failed");
+    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO), TAG, "init spi bus failed");
 
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = LCD_SPI_CLOCK_HZ,
-        .mode = 0,
-        .spics_io_num = LCD_ST7789_PIN_CS,
-        .queue_size = 1,
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = LCD_ST7789_PIN_DC,
+        .cs_gpio_num = LCD_ST7789_PIN_CS,
+        .pclk_hz = LCD_SPI_CLOCK_HZ,
+        .lcd_cmd_bits = LCD_CMD_BITS,
+        .lcd_param_bits = LCD_PARAM_BITS,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+        .on_color_trans_done = lcd_flush_ready,
+        .user_ctx = &s_disp_drv,
     };
-    ESP_RETURN_ON_ERROR(spi_bus_add_device(LCD_HOST, &devcfg, &s_lcd_spi), TAG, "add spi device failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle),
+                        TAG, "create panel io failed");
 
+    esp_lcd_panel_handle_t panel = NULL;
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = LCD_ST7789_PIN_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel),
+                        TAG, "create st7789 panel failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "reset panel failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "init panel failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(panel, true), TAG, "invert color failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "turn on display failed");
     gpio_set_level(LCD_ST7789_PIN_BL, 1);
-    gpio_set_level(LCD_ST7789_PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(LCD_ST7789_PIN_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
 
-    ESP_RETURN_ON_ERROR(lcd_cmd(0x01), TAG, "software reset failed");
-    vTaskDelay(pdMS_TO_TICKS(150));
-    ESP_RETURN_ON_ERROR(lcd_cmd(0x11), TAG, "sleep out failed");
-    vTaskDelay(pdMS_TO_TICKS(120));
+    lv_init();
+    lv_color_t *buf1 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    lv_color_t *buf2 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    assert(buf1);
+    assert(buf2);
+    lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, LCD_ST7789_WIDTH * LVGL_BUFFER_LINES);
 
-    const uint8_t colmod[] = {0x55};
-    const uint8_t madctl[] = {0x00};
-    ESP_RETURN_ON_ERROR(lcd_cmd_data(0x3A, colmod, sizeof(colmod)), TAG, "set color mode failed");
-    ESP_RETURN_ON_ERROR(lcd_cmd_data(0x36, madctl, sizeof(madctl)), TAG, "set memory access failed");
-    ESP_RETURN_ON_ERROR(lcd_cmd(0x21), TAG, "invert display failed");
-    ESP_RETURN_ON_ERROR(lcd_cmd(0x29), TAG, "display on failed");
-    vTaskDelay(pdMS_TO_TICKS(20));
+    lv_disp_drv_init(&s_disp_drv);
+    s_disp_drv.hor_res = LCD_ST7789_WIDTH;
+    s_disp_drv.ver_res = LCD_ST7789_HEIGHT;
+    s_disp_drv.flush_cb = lvgl_flush_cb;
+    s_disp_drv.draw_buf = &s_disp_buf;
+    s_disp_drv.user_data = panel;
+    lv_disp_drv_register(&s_disp_drv);
 
-    return lcd_st7789_fill_screen(LCD_COLOR_BLACK);
+    const esp_timer_create_args_t tick_timer_args = {
+        .callback = lvgl_tick_cb,
+        .name = "lvgl_tick",
+    };
+    esp_timer_handle_t tick_timer = NULL;
+    ESP_RETURN_ON_ERROR(esp_timer_create(&tick_timer_args, &tick_timer), TAG, "create lvgl tick failed");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000), TAG, "start lvgl tick failed");
+
+    BaseType_t task_created = xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 2, NULL);
+    return task_created == pdPASS ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t lcd_st7789_fill_screen(uint16_t color)
+esp_err_t lcd_st7789_show_text(const char *text)
 {
-    return lcd_fill_rect(0, 0, LCD_ST7789_WIDTH, LCD_ST7789_HEIGHT, color);
-}
+    lv_obj_t *screen = lv_scr_act();
+    lv_obj_clean(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
 
-esp_err_t lcd_st7789_draw_string(int x, int y, const char *text, uint16_t color, uint16_t bg_color, int scale)
-{
-    if (scale < 1) {
-        scale = 1;
-    }
-
-    for (int i = 0; text[i] != '\0'; i++) {
-        ESP_RETURN_ON_ERROR(lcd_draw_char(x + i * 6 * scale, y, text[i], color, bg_color, scale),
-                            TAG, "draw string failed");
-    }
+    lv_obj_t *label = lv_label_create(screen);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+#if LV_FONT_SIMSUN_16_CJK
+    lv_obj_set_style_text_font(label, &lv_font_simsun_16_cjk, 0);
+#else
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
+#endif
+    lv_obj_set_width(label, LCD_ST7789_WIDTH);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_timer_handler();
     return ESP_OK;
 }

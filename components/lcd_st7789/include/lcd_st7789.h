@@ -32,7 +32,6 @@
 #define LCD_COLOR_BLUE  0x001F
 
 esp_err_t lcd_st7789_init(void);
-esp_err_t lcd_st7789_fill_screen(uint16_t color);
-esp_err_t lcd_st7789_draw_string(int x, int y, const char *text, uint16_t color, uint16_t bg_color, int scale);
+esp_err_t lcd_st7789_show_text(const char *text);
 
 #endif

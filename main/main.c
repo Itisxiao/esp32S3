@@ -10,10 +10,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting ST7789 LCD example");
 
     ESP_ERROR_CHECK(lcd_st7789_init());
-    ESP_ERROR_CHECK(lcd_st7789_draw_string(36, 104, "hello world",
-                                           LCD_COLOR_WHITE,
-                                           LCD_COLOR_BLACK,
-                                           3));
+    ESP_ERROR_CHECK(lcd_st7789_show_text("hello world\n你好"));
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
