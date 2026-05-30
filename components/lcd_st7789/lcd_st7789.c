@@ -136,17 +136,47 @@ esp_err_t lcd_st7789_show_text(const char *text)
     lv_obj_clean(screen);
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
 
-    lv_obj_t *label = lv_label_create(screen);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_t *status_bar = lv_obj_create(screen);
+    lv_obj_remove_style_all(status_bar);
+    lv_obj_set_size(status_bar, LCD_ST7789_WIDTH, 28);
+    lv_obj_set_style_bg_color(status_bar, lv_color_hex(0x101820), 0);
+    lv_obj_set_style_bg_opa(status_bar, LV_OPA_COVER, 0);
+    lv_obj_align(status_bar, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *wifi = lv_label_create(status_bar);
+    lv_label_set_text(wifi, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(wifi, lv_color_white(), 0);
+    lv_obj_align(wifi, LV_ALIGN_LEFT_MID, 8, 0);
+
+    lv_obj_t *title = lv_label_create(status_bar);
+    lv_label_set_text(title, "ST7789");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *battery = lv_label_create(status_bar);
+    lv_label_set_text(battery, LV_SYMBOL_BATTERY_FULL);
+    lv_obj_set_style_text_color(battery, lv_color_white(), 0);
+    lv_obj_align(battery, LV_ALIGN_RIGHT_MID, -8, 0);
+
+    lv_obj_t *main_label = lv_label_create(screen);
+    lv_label_set_text(main_label, text);
+    lv_obj_set_style_text_color(main_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(main_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_width(main_label, LCD_ST7789_WIDTH);
+    lv_obj_set_style_text_align(main_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(main_label, LV_ALIGN_CENTER, 0, -12);
+
+    lv_obj_t *bottom_label = lv_label_create(screen);
+    lv_label_set_text(bottom_label, "你好，LVGL");
+    lv_obj_set_style_text_color(bottom_label, lv_color_hex(0xA7F3D0), 0);
 #if LV_FONT_SIMSUN_16_CJK
-    lv_obj_set_style_text_font(label, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(bottom_label, &lv_font_simsun_16_cjk, 0);
 #else
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(bottom_label, &lv_font_montserrat_20, 0);
 #endif
-    lv_obj_set_width(label, LCD_ST7789_WIDTH);
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_width(bottom_label, LCD_ST7789_WIDTH);
+    lv_obj_set_style_text_align(bottom_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(bottom_label, LV_ALIGN_BOTTOM_MID, 0, -24);
     lv_timer_handler();
     return ESP_OK;
 }
