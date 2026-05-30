@@ -33,5 +33,10 @@
 
 esp_err_t lcd_st7789_init(void);
 esp_err_t lcd_st7789_show_text(const char *text);
+void lcd_st7789_set_wifi_connected(bool connected);
+void lcd_st7789_set_battery_percent(int percent);
+void lcd_st7789_set_status_text(const char *text);
+void lcd_st7789_set_main_text(const char *text);
+void lcd_st7789_set_bottom_text(const char *text);
 
 #endif

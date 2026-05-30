@@ -11,6 +11,8 @@ void app_main(void)
 
     ESP_ERROR_CHECK(lcd_st7789_init());
     ESP_ERROR_CHECK(lcd_st7789_show_text("hello world"));
+    lcd_st7789_set_status_text("ONLINE");
+    lcd_st7789_set_battery_percent(80);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

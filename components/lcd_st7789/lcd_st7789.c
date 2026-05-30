@@ -23,6 +23,11 @@
 static const char *TAG = "lcd_st7789";
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t s_disp_drv;
+static lv_obj_t *s_wifi_label;
+static lv_obj_t *s_battery_label;
+static lv_obj_t *s_status_label;
+static lv_obj_t *s_main_label;
+static lv_obj_t *s_bottom_label;
 
 static bool lcd_flush_ready(esp_lcd_panel_io_handle_t panel_io,
                             esp_lcd_panel_io_event_data_t *edata,
@@ -143,40 +148,86 @@ esp_err_t lcd_st7789_show_text(const char *text)
     lv_obj_set_style_bg_opa(status_bar, LV_OPA_COVER, 0);
     lv_obj_align(status_bar, LV_ALIGN_TOP_MID, 0, 0);
 
-    lv_obj_t *wifi = lv_label_create(status_bar);
-    lv_label_set_text(wifi, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(wifi, lv_color_white(), 0);
-    lv_obj_align(wifi, LV_ALIGN_LEFT_MID, 8, 0);
+    s_wifi_label = lv_label_create(status_bar);
+    lv_obj_set_style_text_color(s_wifi_label, lv_color_white(), 0);
+    lv_obj_align(s_wifi_label, LV_ALIGN_LEFT_MID, 8, 0);
 
-    lv_obj_t *title = lv_label_create(status_bar);
-    lv_label_set_text(title, "ST7789");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+    s_status_label = lv_label_create(status_bar);
+    lv_obj_set_style_text_color(s_status_label, lv_color_white(), 0);
+    lv_obj_align(s_status_label, LV_ALIGN_CENTER, 0, 0);
 
-    lv_obj_t *battery = lv_label_create(status_bar);
-    lv_label_set_text(battery, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_style_text_color(battery, lv_color_white(), 0);
-    lv_obj_align(battery, LV_ALIGN_RIGHT_MID, -8, 0);
+    s_battery_label = lv_label_create(status_bar);
+    lv_obj_set_style_text_color(s_battery_label, lv_color_white(), 0);
+    lv_obj_align(s_battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
 
-    lv_obj_t *main_label = lv_label_create(screen);
-    lv_label_set_text(main_label, text);
-    lv_obj_set_style_text_color(main_label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(main_label, &lv_font_montserrat_20, 0);
-    lv_obj_set_width(main_label, LCD_ST7789_WIDTH);
-    lv_obj_set_style_text_align(main_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(main_label, LV_ALIGN_CENTER, 0, -12);
+    s_main_label = lv_label_create(screen);
+    lv_obj_set_style_text_color(s_main_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_main_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_width(s_main_label, LCD_ST7789_WIDTH);
+    lv_obj_set_style_text_align(s_main_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_main_label, LV_ALIGN_CENTER, 0, -12);
 
-    lv_obj_t *bottom_label = lv_label_create(screen);
-    lv_label_set_text(bottom_label, "你好，LVGL");
-    lv_obj_set_style_text_color(bottom_label, lv_color_hex(0xA7F3D0), 0);
+    s_bottom_label = lv_label_create(screen);
+    lv_obj_set_style_text_color(s_bottom_label, lv_color_hex(0xA7F3D0), 0);
 #if LV_FONT_SIMSUN_16_CJK
-    lv_obj_set_style_text_font(bottom_label, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(s_bottom_label, &lv_font_simsun_16_cjk, 0);
 #else
-    lv_obj_set_style_text_font(bottom_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(s_bottom_label, &lv_font_montserrat_20, 0);
 #endif
-    lv_obj_set_width(bottom_label, LCD_ST7789_WIDTH);
-    lv_obj_set_style_text_align(bottom_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(bottom_label, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_obj_set_width(s_bottom_label, LCD_ST7789_WIDTH);
+    lv_obj_set_style_text_align(s_bottom_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_bottom_label, LV_ALIGN_BOTTOM_MID, 0, -24);
+
+    lcd_st7789_set_wifi_connected(true);
+    lcd_st7789_set_battery_percent(100);
+    lcd_st7789_set_status_text("ST7789");
+    lcd_st7789_set_main_text(text);
+    lcd_st7789_set_bottom_text("你好，LVGL");
     lv_timer_handler();
     return ESP_OK;
+}
+
+void lcd_st7789_set_wifi_connected(bool connected)
+{
+    if (!s_wifi_label) {
+        return;
+    }
+    lv_label_set_text(s_wifi_label, connected ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE);
+}
+
+void lcd_st7789_set_battery_percent(int percent)
+{
+    if (!s_battery_label) {
+        return;
+    }
+    if (percent >= 80) {
+        lv_label_set_text(s_battery_label, LV_SYMBOL_BATTERY_FULL);
+    } else if (percent >= 40) {
+        lv_label_set_text(s_battery_label, LV_SYMBOL_BATTERY_2);
+    } else if (percent >= 15) {
+        lv_label_set_text(s_battery_label, LV_SYMBOL_BATTERY_1);
+    } else {
+        lv_label_set_text(s_battery_label, LV_SYMBOL_BATTERY_EMPTY);
+    }
+}
+
+void lcd_st7789_set_status_text(const char *text)
+{
+    if (s_status_label) {
+        lv_label_set_text(s_status_label, text);
+    }
+}
+
+void lcd_st7789_set_main_text(const char *text)
+{
+    if (s_main_label) {
+        lv_label_set_text(s_main_label, text);
+    }
+}
+
+void lcd_st7789_set_bottom_text(const char *text)
+{
+    if (s_bottom_label) {
+        lv_label_set_text(s_bottom_label, text);
+    }
 }
