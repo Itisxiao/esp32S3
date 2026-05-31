@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES led lcd_st7789)
+                    REQUIRES led lcd_st7789 wifi_config_portal)

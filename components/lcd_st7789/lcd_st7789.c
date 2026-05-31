@@ -115,8 +115,12 @@ esp_err_t lcd_st7789_init(void)
     gpio_set_level(LCD_ST7789_PIN_BL, 1);
 
     lv_init();
-    lv_color_t *buf1 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA);
-    lv_color_t *buf2 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    lv_color_t *buf1 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    lv_color_t *buf2 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!buf1 || !buf2) {
+        ESP_LOGE(TAG, "FATAL: Cannot allocate internal DMA memory for LVGL");
+        abort(); // 如果这里失败，说明内部 RAM 真的不够了
+    }
     assert(buf1);
     assert(buf2);
     lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, LCD_ST7789_WIDTH * LVGL_BUFFER_LINES);
