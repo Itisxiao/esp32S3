@@ -91,6 +91,8 @@ esp_err_t lcd_st7789_init(void)
         .on_color_trans_done = lcd_flush_ready,
         .user_ctx = &s_disp_drv,
     };
+
+    //创建SPI面板IO对象，SPI总线和面板IO配置作为输入参数，成功创建后返回 SPI IO 句柄
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle),
                         TAG, "create panel io failed");
 
@@ -100,12 +102,16 @@ esp_err_t lcd_st7789_init(void)
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
+    //创建ST7789面板对象，面板IO句柄和面板配置作为输入参数，成功创建后返回面板句柄
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel),
                         TAG, "create st7789 panel failed");
+
+    //初始化面板，执行复位，设置颜色反转，打开显示，成功后返回ESP_OK
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "reset panel failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "init panel failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(panel, true), TAG, "invert color failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "turn on display failed");
+    //打开背光
     gpio_set_level(LCD_ST7789_PIN_BL, 1);
 
     lv_init();
@@ -131,6 +137,7 @@ esp_err_t lcd_st7789_init(void)
     ESP_RETURN_ON_ERROR(esp_timer_create(&tick_timer_args, &tick_timer), TAG, "create lvgl tick failed");
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000), TAG, "start lvgl tick failed");
 
+    //创建一个FreeRTOS任务来处理LVGL的定时器事件，成功创建后返回pdPASS
     BaseType_t task_created = xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 2, NULL);
     return task_created == pdPASS ? ESP_OK : ESP_FAIL;
 }
