@@ -24,7 +24,7 @@ static int retry_count = 0;
 
 // ================= HTML 页面 =================
 static const char *INDEX_HTML = 
-    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
     "<style>body{font-family:sans-serif;text-align:center;padding:20px;} input{padding:10px;margin:5px;width:80%;} button{padding:10px 20px;background:#007bff;color:white;border:none;border-radius:5px;}</style>"
     "</head><body><h2>WiFi 配置</h2><form action='/save' method='POST'>"
     "<input type='text' name='ssid' placeholder='WiFi 名称 (SSID)' required><br>"
@@ -32,13 +32,13 @@ static const char *INDEX_HTML =
     "<button type='submit'>保存并连接</button></form></body></html>";
 
 static const char *SUCCESS_HTML = 
-    "<!DOCTYPE html><html><body><h2>已保存!</h2><p>正在尝试连接... 请查看屏幕状态。</p>"
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'></head><body><h2>已保存!</h2><p>正在尝试连接... 请查看屏幕状态。</p>"
     "<a href='/'>返回</a></body></html>";
 
 // ================= HTTP 处理函数 =================
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
 }
 
@@ -107,7 +107,7 @@ static esp_err_t save_post_handler(httpd_req_t *req) {
     
     retry_count = 0;
     
-    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, SUCCESS_HTML, strlen(SUCCESS_HTML));
 }
 
