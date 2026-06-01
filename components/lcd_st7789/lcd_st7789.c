@@ -52,7 +52,7 @@ static void lvgl_tick_cb(void *arg)
 static void lvgl_task(void *arg)
 {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(50));  // 增加延迟从10ms到50ms
         lv_timer_handler();
     }
 }
@@ -142,7 +142,7 @@ esp_err_t lcd_st7789_init(void)
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000), TAG, "start lvgl tick failed");
 
     //创建一个FreeRTOS任务来处理LVGL的定时器事件，成功创建后返回pdPASS
-    BaseType_t task_created = xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 2, NULL);
+    BaseType_t task_created = xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 0, NULL);
     return task_created == pdPASS ? ESP_OK : ESP_FAIL;
 }
 

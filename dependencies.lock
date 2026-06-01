@@ -18,7 +18,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.3.1
+    version: 5.5.0
   lvgl/lvgl:
     component_hash: 948bff879a345149b83065535bbc4a026ce9f47498a22881e432a264b9098015
     dependencies: []
@@ -29,6 +29,6 @@ dependencies:
 direct_dependencies:
 - 78/esp-wifi-connect
 - lvgl/lvgl
-manifest_hash: c91b3a27382a9f0edc65673202d047f1c0989e944c8ea2c32740343358b5d301
+manifest_hash: ab4d4afa0e99ce835d38ae089d139203d8dd7afb1575b1e69cc55ed0f8eb17de
 target: esp32s3
 version: 2.0.0

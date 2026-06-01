@@ -6,10 +6,13 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "freertos/task.h"
 #include "esp_task_wdt.h"
+
+#include "lwip/ip_addr.h"
 
 static const char *TAG = "wifi_portal";
 
@@ -46,22 +49,32 @@ static esp_err_t save_post_handler(httpd_req_t *req) {
     char buf[512];
     int ret, total_len = req->content_len;
     int cur_len = 0;
+    int timeout = 0;
     
     if (total_len >= sizeof(buf)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content too long");
         return ESP_FAIL;
     }
 
-    while ((ret = httpd_req_recv(req, buf + cur_len, total_len - cur_len)) > 0) {
-        cur_len += ret;
+    while (cur_len < total_len && timeout < 100) {
+        ret = httpd_req_recv(req, buf + cur_len, total_len - cur_len);
+        if (ret > 0) {
+            cur_len += ret;
+            timeout = 0;
+        } else if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            timeout++;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else {
+            ESP_LOGE(TAG, "httpd_req_recv failed: %d", ret);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+            return ESP_FAIL;
+        }
     }
     buf[cur_len] = '\0';
 
-    // 简单解析 (生产环境建议用更健壮的解析库)
     char ssid[33] = {0};
     char pass[65] = {0};
     
-    // 查找 ssid=
     char *ssid_start = strstr(buf, "ssid=");
     if (ssid_start) {
         ssid_start += 5;
@@ -73,37 +86,62 @@ static esp_err_t save_post_handler(httpd_req_t *req) {
         }
     }
 
-    // 查找 pass=
     char *pass_start = strstr(buf, "pass=");
     if (pass_start) {
         pass_start += 5;
-        strcpy(pass, pass_start);
-        // 去除可能的末尾换行或空格
+        char *end = strchr(pass_start, '&');
+        if (end) {
+            strncpy(pass, pass_start, end - pass_start);
+        } else {
+            strcpy(pass, pass_start);
+        }
         size_t len = strlen(pass);
-        if (len > 0 && (pass[len-1] == '\r' || pass[len-1] == '\n')) pass[len-1] = 0;
+        while (len > 0 && (pass[len-1] == '\r' || pass[len-1] == '\n' || pass[len-1] == ' ')) {
+            pass[--len] = 0;
+        }
+    }
+
+    if (strlen(ssid) == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID is required");
+        return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "Received Config: SSID=%s, PASS=%s", ssid, pass);
 
     nvs_handle_t nvs;
-    if (nvs_open("wifi_cfg", NVS_READWRITE, &nvs) == ESP_OK) {
+    esp_err_t err = nvs_open("wifi_cfg", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
         nvs_set_str(nvs, "ssid", ssid);
         nvs_set_str(nvs, "pass", pass);
         nvs_commit(nvs);
         nvs_close(nvs);
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
     }
 
-    // 停止AP模式，切换到Station模式并连接
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    
     wifi_config_t sta_config = {0};
     strncpy((char *)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid) - 1);
     strncpy((char *)sta_config.sta.password, pass, sizeof(sta_config.sta.password) - 1);
-    sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_connect());
+    if (strlen(pass) == 0) {
+        sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    } else {
+        sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+    
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set STA config: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "WiFi config failed");
+        return ESP_FAIL;
+    }
+    
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to connect WiFi: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "WiFi connect failed");
+        return ESP_FAIL;
+    }
     
     retry_count = 0;
     
@@ -116,6 +154,12 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     snprintf(resp, sizeof(resp), "{\"connected\":%s}", is_connected ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, resp, strlen(resp));
+}
+
+static esp_err_t generate_204_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static const httpd_uri_t uri_root = {
@@ -136,14 +180,23 @@ static const httpd_uri_t uri_status = {
     .handler   = status_get_handler,
 };
 
+static const httpd_uri_t uri_generate_204 = {
+    .uri       = "/generate_204",
+    .method    = HTTP_GET,
+    .handler   = generate_204_handler,
+};
+
 static void start_http_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 8192; // 增大 HTTP 任务栈
+    config.stack_size = 8192;
+    config.max_open_sockets = 4;
+    config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &uri_root);
         httpd_register_uri_handler(server, &uri_save);
         httpd_register_uri_handler(server, &uri_status);
+        httpd_register_uri_handler(server, &uri_generate_204);
         ESP_LOGI(TAG, "HTTP Server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP Server");
@@ -154,15 +207,46 @@ static void start_http_server(void) {
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        is_connected = false;
-        ESP_LOGW(TAG, "Disconnected from AP");
-        if (retry_count < MAX_RETRY) {
-            retry_count++;
-            ESP_LOGI(TAG, "Retrying connection (%d/%d)...", retry_count, MAX_RETRY);
-            esp_wifi_connect();
-        } else {
-            ESP_LOGE(TAG, "Max retries reached. Keeping AP open.");
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_DISCONNECTED: {
+                is_connected = false;
+                wifi_event_sta_disconnected_t* disconnect_event = 
+                    (wifi_event_sta_disconnected_t*) event_data;
+                ESP_LOGW(TAG, "Disconnected from AP, reason: %d", 
+                         disconnect_event->reason);
+                if (retry_count < MAX_RETRY) {
+                    retry_count++;
+                    ESP_LOGI(TAG, "Retrying connection (%d/%d)...", 
+                             retry_count, MAX_RETRY);
+                    esp_wifi_connect();
+                } else {
+                    ESP_LOGE(TAG, "Max retries reached. Keeping AP open.");
+                }
+                break;
+            }
+            case WIFI_EVENT_AP_START:
+                ESP_LOGI(TAG, "AP started");
+                break;
+            case WIFI_EVENT_AP_STOP:
+                ESP_LOGW(TAG, "AP stopped");
+                break;
+            case WIFI_EVENT_AP_STACONNECTED: {
+                wifi_event_ap_staconnected_t* connect_event = 
+                    (wifi_event_ap_staconnected_t*) event_data;
+                ESP_LOGI(TAG, "Station " MACSTR " joined, AID=%d", 
+                         MAC2STR(connect_event->mac), connect_event->aid);
+                break;
+            }
+            case WIFI_EVENT_AP_STADISCONNECTED: {
+                wifi_event_ap_stadisconnected_t* disconnect_event = 
+                    (wifi_event_ap_stadisconnected_t*) event_data;
+                ESP_LOGI(TAG, "Station " MACSTR " left, AID=%d", 
+                         MAC2STR(disconnect_event->mac), disconnect_event->aid);
+                break;
+            }
+            default:
+                break;
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
@@ -170,6 +254,40 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         is_connected = true;
         retry_count = 0;
     }
+}
+
+// ================= 设置AP静态IP =================
+static void set_ap_static_ip(void) {
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif == NULL) {
+        ESP_LOGE(TAG, "Failed to get AP netif handle");
+        return;
+    }
+    
+    esp_netif_ip_info_t ip_info;
+    memset(&ip_info, 0, sizeof(ip_info));
+    ip_info.ip.addr = ipaddr_addr(WIFI_CONFIG_PORTAL_AP_IP);
+    ip_info.gw.addr = ipaddr_addr(WIFI_CONFIG_PORTAL_AP_IP);
+    ip_info.netmask.addr = ipaddr_addr("255.255.255.0");
+    
+    esp_err_t err = esp_netif_dhcps_stop(ap_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGE(TAG, "Failed to stop DHCP server: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    err = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set AP IP info: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    err = esp_netif_dhcps_start(ap_netif);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start DHCP server: %s", esp_err_to_name(err));
+    }
+    
+    ESP_LOGI(TAG, "AP IP set to: %s", WIFI_CONFIG_PORTAL_AP_IP);
 }
 
 // ================= 异步启动任务 =================
@@ -201,6 +319,9 @@ static void wifi_start_async_task(void *pvParameters) {
         ESP_LOGE(TAG, "Failed to set AP config: %s", esp_err_to_name(err));
     }
     
+    ESP_LOGI(TAG, "[Async Task] Step 2.5: Setting AP Static IP");
+    set_ap_static_ip();
+    
     vTaskDelay(pdMS_TO_TICKS(100));
     
     ESP_LOGI(TAG, "[Async Task] Step 3: Starting WiFi");
@@ -221,6 +342,7 @@ static void wifi_start_async_task(void *pvParameters) {
     
     vTaskDelete(NULL);
 }
+
 
 // ================= 公共接口 =================
 
