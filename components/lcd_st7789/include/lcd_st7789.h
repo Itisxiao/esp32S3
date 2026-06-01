@@ -1,6 +1,10 @@
 #ifndef LCD_ST7789_H
 #define LCD_ST7789_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "driver/gpio.h"
 #include "esp_err.h"
 
@@ -38,5 +42,9 @@ void lcd_st7789_set_battery_percent(int percent);
 void lcd_st7789_set_status_text(const char *text);
 void lcd_st7789_set_main_text(const char *text);
 void lcd_st7789_set_bottom_text(const char *text);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
