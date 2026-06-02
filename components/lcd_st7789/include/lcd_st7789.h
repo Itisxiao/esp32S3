@@ -11,19 +11,18 @@ extern "C" {
 #define LCD_ST7789_WIDTH  240
 #define LCD_ST7789_HEIGHT 240
 
-// BLK
+/*
+ * ESP32-S3 with Octal PSRAM/Flash uses GPIO33..37 for SPI0/1 high data lines
+ * and DQS. Do not put the LCD on those pins when CONFIG_SPIRAM_MODE_OCT=y.
+ * Rewire the ST7789 to these GPIOs, or change all pins below to another
+ * non-reserved group that matches your board.
+ */
 #define LCD_ST7789_PIN_BL   GPIO_NUM_42
 #define LCD_ST7789_PIN_CS   GPIO_NUM_41
 #define LCD_ST7789_PIN_DC   GPIO_NUM_40
-// RES
-#define LCD_ST7789_PIN_RST  GPIO_NUM_39
-// SPI pins
-#define LCD_ST7789_PIN_MOSI GPIO_NUM_38
-// SCLK
-#define LCD_ST7789_PIN_SCLK GPIO_NUM_37
-
-
-
+#define LCD_ST7789_PIN_RST  GPIO_NUM_45
+#define LCD_ST7789_PIN_MOSI GPIO_NUM_47
+#define LCD_ST7789_PIN_SCLK GPIO_NUM_21
 
 
 #define LCD_ST7789_X_OFFSET 0
@@ -36,7 +35,9 @@ extern "C" {
 #define LCD_COLOR_BLUE  0x001F
 
 esp_err_t lcd_st7789_init(void);
+esp_err_t lcd_st7789_init_lvgl(void);
 esp_err_t lcd_st7789_show_text(const char *text);
+esp_err_t lcd_st7789_start_lvgl_task(void);
 void lcd_st7789_set_wifi_connected(bool connected);
 void lcd_st7789_set_battery_percent(int percent);
 void lcd_st7789_set_status_text(const char *text);

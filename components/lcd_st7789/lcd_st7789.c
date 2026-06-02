@@ -1,6 +1,7 @@
 #include "lcd_st7789.h"
 
 #include <assert.h>
+#include <stdlib.h>
 
 #include "driver/spi_master.h"
 #include "esp_check.h"
@@ -10,15 +11,16 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 
-#define LCD_HOST SPI2_HOST
+#define LCD_HOST SPI3_HOST
 #define LCD_SPI_CLOCK_HZ (40 * 1000 * 1000)
 #define LCD_CMD_BITS 8
 #define LCD_PARAM_BITS 8
 #define LVGL_TICK_PERIOD_MS 2
-#define LVGL_BUFFER_LINES 20
+#define LVGL_BUFFER_LINES 10
 
 static const char *TAG = "lcd_st7789";
 static lv_disp_draw_buf_t s_disp_buf;
@@ -28,6 +30,25 @@ static lv_obj_t *s_battery_label;
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_main_label;
 static lv_obj_t *s_bottom_label;
+
+static esp_lcd_panel_handle_t s_panel = NULL;
+static SemaphoreHandle_t s_lvgl_mutex = NULL;
+static bool s_lvgl_initialized = false;
+static bool s_lvgl_task_started = false;
+
+static void lvgl_lock(void)
+{
+    if (s_lvgl_mutex) {
+        xSemaphoreTakeRecursive(s_lvgl_mutex, portMAX_DELAY);
+    }
+}
+
+static void lvgl_unlock(void)
+{
+    if (s_lvgl_mutex) {
+        xSemaphoreGiveRecursive(s_lvgl_mutex);
+    }
+}
 
 static bool lcd_flush_ready(esp_lcd_panel_io_handle_t panel_io,
                             esp_lcd_panel_io_event_data_t *edata,
@@ -52,13 +73,16 @@ static void lvgl_tick_cb(void *arg)
 static void lvgl_task(void *arg)
 {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(50));  // 增加延迟从10ms到50ms
+        vTaskDelay(pdMS_TO_TICKS(50));
+        lvgl_lock();
         lv_timer_handler();
+        lvgl_unlock();
     }
 }
 
 esp_err_t lcd_st7789_init(void)
 {
+    ESP_LOGI(TAG, "LCD init step 1: Configuring backlight GPIO");
     gpio_config_t backlight_gpio = {
         .pin_bit_mask = 1ULL << LCD_ST7789_PIN_BL,
         .mode = GPIO_MODE_OUTPUT,
@@ -68,6 +92,7 @@ esp_err_t lcd_st7789_init(void)
     };
     ESP_RETURN_ON_ERROR(gpio_config(&backlight_gpio), TAG, "config backlight gpio failed");
     gpio_set_level(LCD_ST7789_PIN_BL, 0);
+    ESP_LOGI(TAG, "LCD init step 2: Initializing SPI bus");
 
     spi_bus_config_t bus_config = {
         .sclk_io_num = LCD_ST7789_PIN_SCLK,
@@ -77,7 +102,8 @@ esp_err_t lcd_st7789_init(void)
         .quadhd_io_num = -1,
         .max_transfer_sz = LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t),
     };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO), TAG, "init spi bus failed");
+    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_DISABLED), TAG, "init spi bus failed");
+    ESP_LOGI(TAG, "LCD init step 3: Creating panel IO");
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_config = {
@@ -92,37 +118,62 @@ esp_err_t lcd_st7789_init(void)
         .user_ctx = &s_disp_drv,
     };
 
-    //创建SPI面板IO对象，SPI总线和面板IO配置作为输入参数，成功创建后返回 SPI IO 句柄
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &io_handle),
                         TAG, "create panel io failed");
+    ESP_LOGI(TAG, "LCD init step 4: Creating ST7789 panel");
 
-    esp_lcd_panel_handle_t panel = NULL;
+    s_panel = NULL;
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_ST7789_PIN_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
-    //创建ST7789面板对象，面板IO句柄和面板配置作为输入参数，成功创建后返回面板句柄
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel),
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io_handle, &panel_config, &s_panel),
                         TAG, "create st7789 panel failed");
+    ESP_LOGI(TAG, "LCD init step 5: Resetting panel");
 
-    //初始化面板，执行复位，设置颜色反转，打开显示，成功后返回ESP_OK
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "reset panel failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "init panel failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(panel, true), TAG, "invert color failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "turn on display failed");
-    //打开背光
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "reset panel failed");
+    ESP_LOGI(TAG, "LCD init step 6: Initializing panel");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "init panel failed");
+    ESP_LOGI(TAG, "LCD init step 7: Setting panel configs");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, true), TAG, "invert color failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "turn on display failed");
     gpio_set_level(LCD_ST7789_PIN_BL, 1);
+    ESP_LOGI(TAG, "LCD init step 8: Hardware init completed");
 
-    lv_init();
-    lv_color_t *buf1 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    lv_color_t *buf2 = heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!buf1 || !buf2) {
-        ESP_LOGE(TAG, "FATAL: Cannot allocate internal DMA memory for LVGL");
-        abort(); // 如果这里失败，说明内部 RAM 真的不够了
+    return ESP_OK;
+}
+
+esp_err_t lcd_st7789_init_lvgl(void)
+{
+    if (s_lvgl_initialized) {
+        return ESP_OK;
     }
-    assert(buf1);
-    assert(buf2);
+    if (!s_panel) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "LCD init step 9: Initializing LVGL");
+    lv_init();
+    s_lvgl_mutex = xSemaphoreCreateRecursiveMutex();
+    if (!s_lvgl_mutex) {
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "LCD init step 10: Allocating LVGL buffers");
+
+    lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(LCD_ST7789_WIDTH * LVGL_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "buf1=%p, buf2=%p", buf1, buf2);
+
+    if (!buf1 || !buf2) {
+        free(buf1);
+        free(buf2);
+        ESP_LOGE(TAG, "Cannot allocate internal DMA memory for LVGL");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "LCD init step 11: Setting up LVGL display");
+
+    lvgl_lock();
     lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, LCD_ST7789_WIDTH * LVGL_BUFFER_LINES);
 
     lv_disp_drv_init(&s_disp_drv);
@@ -130,8 +181,10 @@ esp_err_t lcd_st7789_init(void)
     s_disp_drv.ver_res = LCD_ST7789_HEIGHT;
     s_disp_drv.flush_cb = lvgl_flush_cb;
     s_disp_drv.draw_buf = &s_disp_buf;
-    s_disp_drv.user_data = panel;
+    s_disp_drv.user_data = s_panel;
     lv_disp_drv_register(&s_disp_drv);
+    lvgl_unlock();
+    ESP_LOGI(TAG, "LCD init step 12: Creating LVGL timer");
 
     const esp_timer_create_args_t tick_timer_args = {
         .callback = lvgl_tick_cb,
@@ -140,14 +193,35 @@ esp_err_t lcd_st7789_init(void)
     esp_timer_handle_t tick_timer = NULL;
     ESP_RETURN_ON_ERROR(esp_timer_create(&tick_timer_args, &tick_timer), TAG, "create lvgl tick failed");
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000), TAG, "start lvgl tick failed");
+    s_lvgl_initialized = true;
+    ESP_LOGI(TAG, "LVGL init completed successfully!");
 
-    //创建一个FreeRTOS任务来处理LVGL的定时器事件，成功创建后返回pdPASS
+    return ESP_OK;
+}
+
+esp_err_t lcd_st7789_start_lvgl_task(void)
+{
+    if (!s_lvgl_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_lvgl_task_started) {
+        return ESP_OK;
+    }
     BaseType_t task_created = xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 0, NULL);
-    return task_created == pdPASS ? ESP_OK : ESP_FAIL;
+    if (task_created != pdPASS) {
+        return ESP_FAIL;
+    }
+    s_lvgl_task_started = true;
+    return ESP_OK;
 }
 
 esp_err_t lcd_st7789_show_text(const char *text)
 {
+    if (!s_lvgl_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    lvgl_lock();
     lv_obj_t *screen = lv_scr_act();
     lv_obj_clean(screen);
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
@@ -195,22 +269,26 @@ esp_err_t lcd_st7789_show_text(const char *text)
     lcd_st7789_set_main_text(text);
     lcd_st7789_set_bottom_text("你好，LVGL");
     lv_timer_handler();
+    lvgl_unlock();
     return ESP_OK;
 }
 
 void lcd_st7789_set_wifi_connected(bool connected)
 {
-    if (!s_wifi_label) {
+    if (!s_lvgl_initialized || !s_wifi_label) {
         return;
     }
+    lvgl_lock();
     lv_label_set_text(s_wifi_label, connected ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE);
+    lvgl_unlock();
 }
 
 void lcd_st7789_set_battery_percent(int percent)
 {
-    if (!s_battery_label) {
+    if (!s_lvgl_initialized || !s_battery_label) {
         return;
     }
+    lvgl_lock();
     if (percent >= 80) {
         lv_label_set_text(s_battery_label, LV_SYMBOL_BATTERY_FULL);
     } else if (percent >= 40) {
@@ -220,25 +298,32 @@ void lcd_st7789_set_battery_percent(int percent)
     } else {
         lv_label_set_text(s_battery_label, LV_SYMBOL_BATTERY_EMPTY);
     }
+    lvgl_unlock();
 }
 
 void lcd_st7789_set_status_text(const char *text)
 {
-    if (s_status_label) {
+    if (s_lvgl_initialized && s_status_label) {
+        lvgl_lock();
         lv_label_set_text(s_status_label, text);
+        lvgl_unlock();
     }
 }
 
 void lcd_st7789_set_main_text(const char *text)
 {
-    if (s_main_label) {
+    if (s_lvgl_initialized && s_main_label) {
+        lvgl_lock();
         lv_label_set_text(s_main_label, text);
+        lvgl_unlock();
     }
 }
 
 void lcd_st7789_set_bottom_text(const char *text)
 {
-    if (s_bottom_label) {
+    if (s_lvgl_initialized && s_bottom_label) {
+        lvgl_lock();
         lv_label_set_text(s_bottom_label, text);
+        lvgl_unlock();
     }
 }
