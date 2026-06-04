@@ -1,9 +1,15 @@
 #include "max98357a.h"
 
 #include <string.h>
+#include <math.h>
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "freertos/FreeRTOS.h"
+#include "esp_log.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
 static const char *TAG = "max98357a";
 static i2s_chan_handle_t s_tx_handle = NULL;
@@ -37,7 +43,7 @@ esp_err_t max98357a_init_with_config(const max98357a_config_t *config)
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(s_sample_rate),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = config->bclk_gpio,
@@ -75,22 +81,35 @@ esp_err_t max98357a_write(const int16_t *samples, size_t frame_count, uint32_t t
     ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "samples is NULL");
 
     size_t bytes_written = 0;
-    const size_t bytes_to_write = frame_count * 2 * sizeof(int16_t);
+    const size_t bytes_to_write = frame_count  * sizeof(int16_t);
     return i2s_channel_write(s_tx_handle, samples, bytes_to_write, &bytes_written, pdMS_TO_TICKS(timeout_ms));
 }
 
-esp_err_t max98357a_play_tone(uint32_t frequency_hz, uint32_t duration_ms, int16_t volume)
+esp_err_t max98357a_play_wav(const uint8_t *wav_data, size_t wav_size)
 {
+    ESP_RETURN_ON_FALSE(wav_data != NULL && wav_size > 44, ESP_ERR_INVALID_ARG, TAG, "invalid wav data");
+
+    // 简单解析 WAV 头部，假设是标准的 44 字节 PCM 格式
+    const uint8_t *data_ptr = wav_data + 44;
+    size_t data_size = wav_size - 44;
+
+    size_t frame_count = data_size / (1 * sizeof(int16_t));
+
+    return max98357a_write((const int16_t *)data_ptr, frame_count, 5000);
+}
+
+esp_err_t max98357a_play_tone(uint32_t frequency_hz, uint32_t duration_ms, int16_t volume)
+{   
     ESP_RETURN_ON_FALSE(s_tx_handle != NULL, ESP_ERR_INVALID_STATE, TAG, "not initialized");
     ESP_RETURN_ON_FALSE(frequency_hz > 0 && duration_ms > 0, ESP_ERR_INVALID_ARG, TAG, "invalid tone");
 
-    int16_t buffer[256 * 2];
+    static int16_t buffer[512 * 2];   // 静态分配，只初始化一次
     const uint32_t total_frames = (s_sample_rate * duration_ms) / 1000;
     uint32_t phase = 0;
     uint32_t frames_written = 0;
 
     while (frames_written < total_frames) {
-        const uint32_t chunk_frames = (total_frames - frames_written) > 256 ? 256 : (total_frames - frames_written);
+        const uint32_t chunk_frames = (total_frames - frames_written) > 512 ? 512 : (total_frames - frames_written);
 
         for (uint32_t i = 0; i < chunk_frames; i++) {
             const int16_t sample = phase < (s_sample_rate / 2) ? volume : -volume;
@@ -102,6 +121,7 @@ esp_err_t max98357a_play_tone(uint32_t frequency_hz, uint32_t duration_ms, int16
                 phase -= s_sample_rate;
             }
         }
+        ESP_LOGI(TAG, "sample_rate=%lu, total_frames=%lu", s_sample_rate, total_frames);    
 
         esp_err_t err = max98357a_write(buffer, chunk_frames, 1000);
         if (err != ESP_OK) {
@@ -110,9 +130,13 @@ esp_err_t max98357a_play_tone(uint32_t frequency_hz, uint32_t duration_ms, int16
         frames_written += chunk_frames;
     }
 
+
     memset(buffer, 0, sizeof(buffer));
     return max98357a_write(buffer, 256, 1000);
+    
 }
+
+
 
 esp_err_t max98357a_deinit(void)
 {

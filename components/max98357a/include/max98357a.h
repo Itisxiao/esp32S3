@@ -28,6 +28,7 @@ esp_err_t max98357a_init_with_config(const max98357a_config_t *config);
 esp_err_t max98357a_write(const int16_t *samples, size_t frame_count, uint32_t timeout_ms);
 esp_err_t max98357a_play_tone(uint32_t frequency_hz, uint32_t duration_ms, int16_t volume);
 esp_err_t max98357a_deinit(void);
+esp_err_t max98357a_play_wav(const uint8_t *wav_data, size_t wav_size);
 
 #ifdef __cplusplus
 }

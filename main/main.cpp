@@ -9,9 +9,11 @@
 #include "max98357a.h"
 #include "wifi_manager.h"
 #include "ssid_manager.h"
+#include "enter_config.h"
 #include <cstdio>
 
 static const char *TAG = "main";
+
 
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "=== Application Start ===");
@@ -43,8 +45,9 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "Step 4: Init Speaker...");
     bool speaker_ok = (max98357a_init() == ESP_OK);
-    if (speaker_ok) {
-        max98357a_play_tone(1000, 120, 3000);
+        if (speaker_ok) {
+        //max98357a_play_tone(1000, 120, 3000);
+        max98357a_play_wav(enter_config_wav, enter_config_wav_len);
     }
     ESP_LOGI(TAG, "Step 4: Speaker %s", speaker_ok ? "OK" : "FAILED");
 
