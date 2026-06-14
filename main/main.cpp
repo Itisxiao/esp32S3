@@ -177,7 +177,7 @@ extern "C" void app_main(void) {
     if (ssid_list.empty()) {
         ESP_LOGI(TAG, "Step 7: Start Config AP");
         wifi_manager.StartConfigAp();
-        if (lcd_ok) lcd_st7789_show_text("AP Mode");
+        if (lcd_ok) lcd_st7789_show_text("请连接热点并配置 Wi-Fi");
     } else {
         ESP_LOGI(TAG, "Step 7: Start Station");
         wifi_manager.StartStation();
