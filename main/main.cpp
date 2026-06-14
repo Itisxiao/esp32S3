@@ -132,10 +132,11 @@ extern "C" void app_main(void) {
     bool mic_ok = (inmp441_init() == ESP_OK);
     ESP_LOGI(TAG, "Step 4.5: Microphone %s", mic_ok ? "OK" : "FAILED");
     if (mic_ok) {
-        // 测试麦克风: 读取 1 秒音频并打印音量
+        vTaskDelay(pdMS_TO_TICKS(100));  // 等待 I2S DMA 稳定
+        // 测试麦克风: 读取音频并打印音量
         int16_t test_buf[1600];  // 16kHz * 0.1s = 1600 samples
         size_t frames_read = 0;
-        if (inmp441_read(test_buf, 1600, 200, &frames_read) == ESP_OK) {
+        if (inmp441_read(test_buf, 1600, 500, &frames_read) == ESP_OK) {
             int64_t sum_sq = 0;
             for (size_t i = 0; i < frames_read; i++) {
                 int32_t s = test_buf[i];

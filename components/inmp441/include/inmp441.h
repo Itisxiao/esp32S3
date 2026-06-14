@@ -12,8 +12,8 @@ extern "C" {
 #endif
 
 /* ================= 默认 GPIO 引脚定义 ================= */
-#define INMP441_BCK_GPIO    GPIO_NUM_4    /* I2S 位时钟 (BCLK) */
-#define INMP441_WS_GPIO     GPIO_NUM_5    /* I2S 字选择 (LRCLK/WS) */
+#define INMP441_BCK_GPIO    GPIO_NUM_5    /* I2S 位时钟 (BCLK) */
+#define INMP441_WS_GPIO     GPIO_NUM_4    /* I2S 字选择 (LRCLK/WS) */
 #define INMP441_DIN_GPIO    GPIO_NUM_6    /* I2S 数据输入 (SD/DOUT from mic) */
 
 /* ================= 默认音频参数 ================= */
