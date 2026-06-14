@@ -14,8 +14,10 @@
 #include "ssid_manager.h"
 #include "websocket_client.h"
 #include "enter_config.h"
+#include "inmp441.h"
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 
 static const char *TAG = "main";
 
@@ -125,6 +127,24 @@ extern "C" void app_main(void) {
         max98357a_play_wav(enter_config_wav, enter_config_wav_len);
     }
     ESP_LOGI(TAG, "Step 4: Speaker %s", speaker_ok ? "OK" : "FAILED");
+
+    ESP_LOGI(TAG, "Step 4.5: Init Microphone (INMP441)...");
+    bool mic_ok = (inmp441_init() == ESP_OK);
+    ESP_LOGI(TAG, "Step 4.5: Microphone %s", mic_ok ? "OK" : "FAILED");
+    if (mic_ok) {
+        // 测试麦克风: 读取 1 秒音频并打印音量
+        int16_t test_buf[1600];  // 16kHz * 0.1s = 1600 samples
+        size_t frames_read = 0;
+        if (inmp441_read(test_buf, 1600, 200, &frames_read) == ESP_OK) {
+            int64_t sum_sq = 0;
+            for (size_t i = 0; i < frames_read; i++) {
+                int32_t s = test_buf[i];
+                sum_sq += s * s;
+            }
+            int volume = (frames_read > 0) ? (int)sqrtf((float)(sum_sq / frames_read)) : 0;
+            ESP_LOGI(TAG, "Mic test: read %d frames, RMS volume=%d", (int)frames_read, volume);
+        }
+    }
 
     ESP_LOGI(TAG, "Step 5: Init LCD...");
     bool lcd_ok = (lcd_st7789_init() == ESP_OK);
