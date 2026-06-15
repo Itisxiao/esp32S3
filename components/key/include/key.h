@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#define KEY_GPIO GPIO_NUM_0
+#define KEY_GPIO GPIO_NUM_12
 
 /* ================= 按键事件 ================= */
 typedef enum {
