@@ -118,14 +118,16 @@ esp_err_t ws_client_send(const char *data, size_t len)
 esp_err_t ws_client_send_bin(const uint8_t *data, size_t len)
 {
     if (ws_client == NULL || !ws_connected) {
-        ESP_LOGW(TAG, "WebSocket 未连接，无法发送");
         return ESP_ERR_INVALID_STATE;
     }
 
     int sent = esp_websocket_client_send_bin(ws_client, (const char *)data, (int)len, portMAX_DELAY);
     if (sent < 0) {
-        ESP_LOGE(TAG, "二进制发送失败");
+        ESP_LOGE(TAG, "二进制发送失败: %d", sent);
         return ESP_FAIL;
+    }
+    if ((size_t)sent != len) {
+        ESP_LOGW(TAG, "二进制发送不完整: %d/%d", sent, (int)len);
     }
 
     return ESP_OK;

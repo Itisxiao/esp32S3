@@ -47,8 +47,8 @@ esp_err_t inmp441_init_with_config(const inmp441_config_t *config)
 
     /* ---- 创建 I2S RX 通道 ---- */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num  = 6;
-    chan_cfg.dma_frame_num = 240;
+    chan_cfg.dma_desc_num  = 8;
+    chan_cfg.dma_frame_num = 320;
 
     esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &s_rx_handle);
     if (err != ESP_OK) {
@@ -234,14 +234,15 @@ static void stream_task(void *arg)
 {
     uint32_t chunk_frames = s_sample_rate * s_stream_chunk_ms / 1000;
 
-    /* 为原始 32bit 数据和转换后 16bit 数据各分配缓冲区 */
-    int32_t *raw_buf  = heap_caps_malloc(chunk_frames * sizeof(int32_t), MALLOC_CAP_DMA);
+    /* 为原始 32bit 数据和转换后 16bit 数据各分配缓冲区
+     * raw_buf 需要预留 chunk_frames + 240, 防止累积阶段越界写入 */
+    int32_t *raw_buf  = heap_caps_malloc((chunk_frames + 240) * sizeof(int32_t), MALLOC_CAP_DMA);
     int16_t *pcm_buf  = heap_caps_malloc(chunk_frames * sizeof(int16_t), MALLOC_CAP_INTERNAL);
 
     if (raw_buf == NULL || pcm_buf == NULL) {
         ESP_LOGE(TAG, "[STREAM] 缓冲区分配失败");
-        if (raw_buf) free(raw_buf);
-        if (pcm_buf) free(pcm_buf);
+        if (raw_buf) heap_caps_free(raw_buf);
+        if (pcm_buf) heap_caps_free(pcm_buf);
         s_stream_running = false;
         s_stream_task = NULL;
         vTaskDelete(NULL);
@@ -251,34 +252,76 @@ static void stream_task(void *arg)
     ESP_LOGI(TAG, "[STREAM] 流式任务启动, chunk=%lu ms (%lu frames)",
              (unsigned long)s_stream_chunk_ms, (unsigned long)chunk_frames);
 
+    uint32_t total_chunks = 0;
+    uint32_t total_frames = 0;
+    uint32_t empty_reads = 0;
+
+    /* 每次读一个完整 chunk, 与 dma_frame_num (320) 对齐,
+     * 避免跨 DMA 描述符导致 ESP_ERR_TIMEOUT */
+    //uint32_t read_unit = chunk_frames;
+    uint32_t read_unit = 160;  /* 160 frames = 10ms, 320 frames = 20ms, chunk_frames 可能是 320 或 160 */
+
+    uint32_t offset = 0;  /* raw_buf 中已累积的帧数 */
+
     while (s_stream_running) {
         size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(s_rx_handle, raw_buf,
-                                         chunk_frames * sizeof(int32_t),
+        esp_err_t err = i2s_channel_read(s_rx_handle,
+                                         raw_buf + offset,
+                                         read_unit * sizeof(int32_t),
                                          &bytes_read,
                                          pdMS_TO_TICKS(100));
-        if (err != ESP_OK || bytes_read == 0) {
+        if (err == ESP_ERR_TIMEOUT) {
+            // 超时是正常情况，不要清 offset（保留已累积的帧）
             vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "[STREAM] i2s_channel_read err: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(1));
+            offset = 0;
+            continue;
+        }
+
+        if (bytes_read == 0) {
+            empty_reads++;
             continue;
         }
 
         size_t frames = bytes_read / sizeof(int32_t);
+        offset += frames;
 
-        /* 32bit -> 16bit 转换 */
-        for (size_t i = 0; i < frames; i++) {
-            pcm_buf[i] = (int16_t)(raw_buf[i] >> 14);
-        }
+        /* 累积够一个完整 chunk 后回调 */
+        if (offset >= chunk_frames) {
+            /* 32bit -> 16bit 转换 */
+            for (uint32_t i = 0; i < chunk_frames; i++) {
+                pcm_buf[i] = (int16_t)(raw_buf[i] >> 14);
+            }
 
-        /* 回调给用户 */
-        if (s_stream_cb) {
-            s_stream_cb(pcm_buf, frames, s_stream_user_ctx);
+            total_chunks++;
+            total_frames += chunk_frames;
+
+            if (s_stream_cb) {
+                s_stream_cb(pcm_buf, chunk_frames, s_stream_user_ctx);
+            }
+
+            /* 处理多余帧（粘滞到下一轮） */
+            if (offset > chunk_frames) {
+                uint32_t leftover = offset - chunk_frames;
+                memmove(raw_buf, raw_buf + chunk_frames, leftover * sizeof(int32_t));
+                offset = leftover;
+            } else {
+                offset = 0;
+            }
         }
     }
 
-    free(raw_buf);
-    free(pcm_buf);
+    heap_caps_free(raw_buf);
+    heap_caps_free(pcm_buf);
 
-    ESP_LOGI(TAG, "[STREAM] 流式任务退出");
+    float duration_sec = (float)total_frames / (float)s_sample_rate;
+    ESP_LOGI(TAG, "[STREAM] 流式任务退出: %lu chunks, %lu frames, %.2f 秒, 空读=%lu",
+             (unsigned long)total_chunks, (unsigned long)total_frames,
+             duration_sec, (unsigned long)empty_reads);
     s_stream_task = NULL;
     vTaskDelete(NULL);
 }

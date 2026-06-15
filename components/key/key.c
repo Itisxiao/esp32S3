@@ -85,7 +85,7 @@ void key_init(void)
 {
     /* 配置 GPIO：输入，双边沿中断 */
     gpio_config_t io_conf = {
-        .intr_type    = GPIO_INTR_NEGEDGE,
+        .intr_type    = GPIO_INTR_ANYEDGE,
         .mode         = GPIO_MODE_INPUT,
         .pin_bit_mask = (1ULL << KEY_GPIO),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -111,7 +111,7 @@ void key_init(void)
 
     /* 创建消抖任务 */
     if (s_debounce_task == NULL) {
-        xTaskCreate(debounce_task, "key_debounce", 2048, NULL, 6, &s_debounce_task);
+        xTaskCreate(debounce_task, "key_debounce", 4096, NULL, 6, &s_debounce_task);
     }
 
     ESP_LOGI(TAG, "按键初始化完成, GPIO=%d, 初始状态=%s",

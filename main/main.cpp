@@ -1,6 +1,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_netif.h"
@@ -34,17 +35,80 @@ static const char *TAG = "main";
 
 // ================= 录音参数 =================
 #define RECORD_CHUNK_MS       20    // 每次发送 20ms 音频
+#define AUDIO_QUEUE_LEN      30    // 音频队列深度 (30 × 20ms = 600ms 缓冲)
+// 16kHz × 20ms = 320 frames × 2 bytes = 640 bytes per chunk
+#define AUDIO_CHUNK_BYTES    640
 
 // ================= 全局状态 =================
 static EventGroupHandle_t s_event_group = NULL;
 static bool s_lcd_ok = false;
 static bool s_ws_started = false;
 
-// ================= 音频流回调：每 chunk 由 inmp441 后台任务调用 =================
+// ================= 音频队列：解耦 I2S 读取和 WebSocket 发送 =================
+static QueueHandle_t s_audio_queue = NULL;
+static TaskHandle_t  s_audio_sender_task = NULL;
+static volatile bool s_sender_running = false;
+
+// 录音统计
+static uint32_t s_record_chunks_enqueued = 0;
+static uint32_t s_record_chunks_sent = 0;
+static uint32_t s_record_chunks_dropped = 0;
+
+/**
+ * @brief 独立的 WebSocket 音频发送任务
+ *
+ * 从队列中取出音频数据并通过 WebSocket 发送。
+ * 即使 WebSocket 发送阻塞，也不影响 I2S 流式任务的读取。
+ */
+static void audio_sender_task(void *arg)
+{
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(AUDIO_CHUNK_BYTES, MALLOC_CAP_INTERNAL);
+    if (!buf) {
+        ESP_LOGE(TAG, "[SENDER] 缓冲区分配失败");
+        s_sender_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[SENDER] 音频发送任务启动");
+
+    while (s_sender_running) {
+        if (xQueueReceive(s_audio_queue, buf, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (ws_client_is_connected()) {
+                ws_client_send_bin(buf, AUDIO_CHUNK_BYTES);
+                s_record_chunks_sent++;
+            }
+        }
+    }
+
+    // 排空队列中剩余数据
+    while (xQueueReceive(s_audio_queue, buf, 0) == pdTRUE) {
+        if (ws_client_is_connected()) {
+            ws_client_send_bin(buf, AUDIO_CHUNK_BYTES);
+            s_record_chunks_sent++;
+        }
+    }
+
+    free(buf);
+    ESP_LOGI(TAG, "[SENDER] 音频发送任务退出, 已发送 %lu chunks",
+             (unsigned long)s_record_chunks_sent);
+    s_audio_sender_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// ================= 音频流回调：仅入队，不阻塞 =================
 static void audio_stream_callback(const int16_t *samples, size_t frame_count, void *user_ctx)
 {
-    if (ws_client_is_connected()) {
-        ws_client_send_bin((const uint8_t *)samples, frame_count * sizeof(int16_t));
+    if (s_audio_queue && s_sender_running) {
+        if (xQueueSend(s_audio_queue, samples, 0) != pdTRUE) {
+            s_record_chunks_dropped++;
+            if (s_record_chunks_dropped <= 5 || (s_record_chunks_dropped % 50 == 0)) {
+                ESP_LOGW(TAG, "[AUDIO] 队列满, 已丢弃 %lu chunks",
+                         (unsigned long)s_record_chunks_dropped);
+            }
+        } else {
+            s_record_chunks_enqueued++;
+        }
     }
 }
 
@@ -59,6 +123,20 @@ static void on_key_event(key_event_t event, void *user_ctx)
             ws_client_send(start_msg, strlen(start_msg));
 
             if (!inmp441_is_streaming()) {
+                // 重置统计
+                s_record_chunks_enqueued = 0;
+                s_record_chunks_sent = 0;
+                s_record_chunks_dropped = 0;
+
+                // 创建音频队列和发送任务
+                if (!s_audio_queue) {
+                    s_audio_queue = xQueueCreate(AUDIO_QUEUE_LEN, AUDIO_CHUNK_BYTES);
+                }
+                if (s_audio_queue && !s_audio_sender_task) {
+                    s_sender_running = true;
+                    xTaskCreate(audio_sender_task, "audio_send", 4096, NULL, 6, &s_audio_sender_task);
+                }
+
                 inmp441_start_stream(audio_stream_callback, NULL, RECORD_CHUNK_MS);
             }
         } else {
@@ -68,13 +146,37 @@ static void on_key_event(key_event_t event, void *user_ctx)
     else if (event == KEY_EVENT_RELEASED) {
         ESP_LOGI(TAG, "[KEY] 松开事件");
 
+        // 1. 先停止 I2S 流式读取
         if (inmp441_is_streaming()) {
             inmp441_stop_stream();
         }
 
+        // 2. 等待发送任务排空队列（最多 2 秒）
+        if (s_sender_running) {
+            s_sender_running = false;
+            // 等待发送任务退出（它会先排空队列再退出）
+            for (int i = 0; i < 200 && s_audio_sender_task != NULL; i++) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+
+        // 3. 发送 stop 消息（此时所有音频数据已发送完毕）
         if (ws_client_is_connected()) {
             const char *stop_msg = "{\"action\":\"stop\"}";
             ws_client_send(stop_msg, strlen(stop_msg));
+        }
+
+        // 4. 打印录音统计
+        ESP_LOGI(TAG, "[RECORD] 统计: 入队=%lu, 发送=%lu, 丢弃=%lu, 约 %.1f 秒",
+                 (unsigned long)s_record_chunks_enqueued,
+                 (unsigned long)s_record_chunks_sent,
+                 (unsigned long)s_record_chunks_dropped,
+                 s_record_chunks_sent * RECORD_CHUNK_MS / 1000.0f);
+
+        // 5. 清理队列
+        if (s_audio_queue) {
+            vQueueDelete(s_audio_queue);
+            s_audio_queue = NULL;
         }
     }
 }
@@ -295,6 +397,17 @@ extern "C" void app_main(void) {
             // 如果正在录音，强制停止
             if (inmp441_is_streaming()) {
                 inmp441_stop_stream();
+            }
+            // 停止发送任务
+            if (s_sender_running) {
+                s_sender_running = false;
+                for (int i = 0; i < 50 && s_audio_sender_task != NULL; i++) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+            if (s_audio_queue) {
+                vQueueDelete(s_audio_queue);
+                s_audio_queue = NULL;
             }
             if (s_lcd_ok) lcd_st7789_set_status_text("ONLINE");
         }
