@@ -15,6 +15,8 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 
+LV_FONT_DECLARE(font_chinese_16);
+
 #define LCD_HOST SPI3_HOST
 #define LCD_SPI_CLOCK_HZ (40 * 1000 * 1000)
 #define LCD_CMD_BITS 8
@@ -247,22 +249,14 @@ esp_err_t lcd_st7789_show_text(const char *text)
 
     s_main_label = lv_label_create(screen);
     lv_obj_set_style_text_color(s_main_label, lv_color_white(), 0);
-#if LV_FONT_SIMSUN_16_CJK
-    lv_obj_set_style_text_font(s_main_label, &lv_font_simsun_16_cjk, 0);
-#else
-    lv_obj_set_style_text_font(s_main_label, &lv_font_montserrat_20, 0);
-#endif
+    lv_obj_set_style_text_font(s_main_label, &font_chinese_16, 0);
     lv_obj_set_width(s_main_label, LCD_ST7789_WIDTH);
     lv_obj_set_style_text_align(s_main_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_main_label, LV_ALIGN_CENTER, 0, -12);
 
     s_bottom_label = lv_label_create(screen);
     lv_obj_set_style_text_color(s_bottom_label, lv_color_hex(0xA7F3D0), 0);
-#if LV_FONT_SIMSUN_16_CJK
-    lv_obj_set_style_text_font(s_bottom_label, &lv_font_simsun_16_cjk, 0);
-#else
-    lv_obj_set_style_text_font(s_bottom_label, &lv_font_montserrat_20, 0);
-#endif
+    lv_obj_set_style_text_font(s_bottom_label, &font_chinese_16, 0);
     lv_obj_set_width(s_bottom_label, LCD_ST7789_WIDTH);
     lv_obj_set_style_text_align(s_bottom_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_bottom_label, LV_ALIGN_BOTTOM_MID, 0, -24);
