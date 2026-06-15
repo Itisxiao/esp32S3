@@ -45,6 +45,14 @@ esp_err_t ws_client_start(void);
 esp_err_t ws_client_send(const char *data, size_t len);
 
 /**
+ * @brief 发送二进制消息
+ * @param data 数据
+ * @param len  长度
+ * @return ESP_OK 成功
+ */
+esp_err_t ws_client_send_bin(const uint8_t *data, size_t len);
+
+/**
  * @brief 获取当前连接状态
  */
 bool ws_client_is_connected(void);

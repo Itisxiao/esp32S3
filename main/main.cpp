@@ -15,6 +15,7 @@
 #include "websocket_client.h"
 #include "enter_config.h"
 #include "inmp441.h"
+#include "key.h"
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -22,7 +23,7 @@
 static const char *TAG = "main";
 
 // TODO: 替换为你的后端服务器地址
-#define WS_SERVER_URI "ws://192.168.1.100:8080/ws"
+#define WS_SERVER_URI "ws://192.168.0.101:8080//ws/audio"
 
 // ================= EventGroup 事件位定义 =================
 #define EVENT_NETWORK_CONNECTED   BIT0   // 获取到 IP
@@ -31,10 +32,52 @@ static const char *TAG = "main";
 #define EVENT_WS_DISCONNECTED     BIT3   // WebSocket 断开
 #define EVENT_TIMEOUT_TICK        BIT4   // 1秒定时心跳
 
+// ================= 录音参数 =================
+#define RECORD_CHUNK_MS       20    // 每次发送 20ms 音频
+
 // ================= 全局状态 =================
 static EventGroupHandle_t s_event_group = NULL;
 static bool s_lcd_ok = false;
 static bool s_ws_started = false;
+
+// ================= 音频流回调：每 chunk 由 inmp441 后台任务调用 =================
+static void audio_stream_callback(const int16_t *samples, size_t frame_count, void *user_ctx)
+{
+    if (ws_client_is_connected()) {
+        ws_client_send_bin((const uint8_t *)samples, frame_count * sizeof(int16_t));
+    }
+}
+
+// ================= 按键事件回调（由消抖任务调用，可安全使用阻塞 API） =================
+static void on_key_event(key_event_t event, void *user_ctx)
+{
+    if (event == KEY_EVENT_PRESSED) {
+        ESP_LOGI(TAG, "[KEY] 按下事件");
+
+        if (ws_client_is_connected()) {
+            const char *start_msg = "{\"action\":\"start\"}";
+            ws_client_send(start_msg, strlen(start_msg));
+
+            if (!inmp441_is_streaming()) {
+                inmp441_start_stream(audio_stream_callback, NULL, RECORD_CHUNK_MS);
+            }
+        } else {
+            ESP_LOGW(TAG, "[KEY] WS 未连接，忽略录音请求");
+        }
+    }
+    else if (event == KEY_EVENT_RELEASED) {
+        ESP_LOGI(TAG, "[KEY] 松开事件");
+
+        if (inmp441_is_streaming()) {
+            inmp441_stop_stream();
+        }
+
+        if (ws_client_is_connected()) {
+            const char *stop_msg = "{\"action\":\"stop\"}";
+            ws_client_send(stop_msg, strlen(stop_msg));
+        }
+    }
+}
 
 // ================= 回调：仅设置 EventGroup bit，不做业务逻辑 =================
 
@@ -147,6 +190,11 @@ extern "C" void app_main(void) {
         }
     }
 
+    ESP_LOGI(TAG, "Step 4.6: Init Key...");
+    key_init();
+    key_set_callback(on_key_event, NULL);
+    ESP_LOGI(TAG, "Step 4.6: Key OK");
+
     ESP_LOGI(TAG, "Step 5: Init LCD...");
     bool lcd_ok = (lcd_st7789_init() == ESP_OK);
     if (lcd_ok) {
@@ -244,12 +292,26 @@ extern "C" void app_main(void) {
         // ---------- WebSocket 断开 ----------
         if (bits & EVENT_WS_DISCONNECTED) {
             ESP_LOGW(TAG, "[WS] 与后端服务器断开");
+            // 如果正在录音，强制停止
+            if (inmp441_is_streaming()) {
+                inmp441_stop_stream();
+            }
             if (s_lcd_ok) lcd_st7789_set_status_text("ONLINE");
         }
 
         // ---------- 1秒心跳：连接超时回退 AP ----------
         if (bits & EVENT_TIMEOUT_TICK) {
             if (!wifi_manager.IsConnected() && !wifi_manager.IsConfigMode()) {
+                // 配网完成后退出 AP 模式，但 Station 未启动 —— 立即启动 Station
+                auto& ssid_list = SsidManager::GetInstance().GetSsidList();
+                if (!ssid_list.empty() && timeout_counter == 0) {
+                    ESP_LOGI(TAG, "配网完成，启动 Station 模式连接已保存的 WiFi");
+                    wifi_manager.StartStation();
+                    if (s_lcd_ok) lcd_st7789_show_text("Connecting...");
+                    timeout_counter = 1;  // 避免重复触发
+                    continue;
+                }
+
                 timeout_counter++;
                 if (timeout_counter > 60) {
                     ESP_LOGW(TAG, "Timeout -> Switch AP");

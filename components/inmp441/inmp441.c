@@ -2,10 +2,13 @@
 
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "inmp441";
 static i2s_chan_handle_t s_rx_handle = NULL;
@@ -211,4 +214,126 @@ esp_err_t inmp441_detect_voice(int threshold, bool *has_voice, int *volume_out)
     *has_voice = (vol > threshold);
     if (volume_out) *volume_out = vol;
     return ESP_OK;
+}
+
+/* ================= 流式读取实现 ================= */
+
+static volatile bool         s_stream_running  = false;
+static TaskHandle_t          s_stream_task     = NULL;
+static inmp441_stream_cb_t   s_stream_cb       = NULL;
+static void                 *s_stream_user_ctx = NULL;
+static uint32_t              s_stream_chunk_ms = 20;
+
+/**
+ * @brief 流式读取后台任务：持续从 I2S 读取并通过回调输出
+ *
+ * 使用独立缓冲区，与 inmp441_read 的 s_raw_buf 互不干扰。
+ * 由于流式任务运行期间不应再调用 inmp441_read，不存在竞争。
+ */
+static void stream_task(void *arg)
+{
+    uint32_t chunk_frames = s_sample_rate * s_stream_chunk_ms / 1000;
+
+    /* 为原始 32bit 数据和转换后 16bit 数据各分配缓冲区 */
+    int32_t *raw_buf  = heap_caps_malloc(chunk_frames * sizeof(int32_t), MALLOC_CAP_DMA);
+    int16_t *pcm_buf  = heap_caps_malloc(chunk_frames * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+
+    if (raw_buf == NULL || pcm_buf == NULL) {
+        ESP_LOGE(TAG, "[STREAM] 缓冲区分配失败");
+        if (raw_buf) free(raw_buf);
+        if (pcm_buf) free(pcm_buf);
+        s_stream_running = false;
+        s_stream_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[STREAM] 流式任务启动, chunk=%lu ms (%lu frames)",
+             (unsigned long)s_stream_chunk_ms, (unsigned long)chunk_frames);
+
+    while (s_stream_running) {
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_channel_read(s_rx_handle, raw_buf,
+                                         chunk_frames * sizeof(int32_t),
+                                         &bytes_read,
+                                         pdMS_TO_TICKS(100));
+        if (err != ESP_OK || bytes_read == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        size_t frames = bytes_read / sizeof(int32_t);
+
+        /* 32bit -> 16bit 转换 */
+        for (size_t i = 0; i < frames; i++) {
+            pcm_buf[i] = (int16_t)(raw_buf[i] >> 14);
+        }
+
+        /* 回调给用户 */
+        if (s_stream_cb) {
+            s_stream_cb(pcm_buf, frames, s_stream_user_ctx);
+        }
+    }
+
+    free(raw_buf);
+    free(pcm_buf);
+
+    ESP_LOGI(TAG, "[STREAM] 流式任务退出");
+    s_stream_task = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t inmp441_start_stream(inmp441_stream_cb_t cb, void *user_ctx, uint32_t chunk_ms)
+{
+    ESP_RETURN_ON_FALSE(s_rx_handle != NULL, ESP_ERR_INVALID_STATE, TAG, "not initialized");
+    ESP_RETURN_ON_FALSE(cb != NULL, ESP_ERR_INVALID_ARG, TAG, "callback is NULL");
+
+    if (s_stream_running) {
+        ESP_LOGW(TAG, "[STREAM] 已在运行，先停止旧流");
+        inmp441_stop_stream();
+    }
+
+    s_stream_cb       = cb;
+    s_stream_user_ctx = user_ctx;
+    s_stream_chunk_ms = (chunk_ms == 0) ? 20 : chunk_ms;
+    s_stream_running  = true;
+
+    BaseType_t ret = xTaskCreate(stream_task, "i2s_stream", 4096, NULL, 5, &s_stream_task);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "[STREAM] 任务创建失败");
+        s_stream_running = false;
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t inmp441_stop_stream(void)
+{
+    if (!s_stream_running) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "[STREAM] 停止流式读取...");
+    s_stream_running = false;
+
+    /* 等待任务自行退出，最多 500ms */
+    for (int i = 0; i < 50 && s_stream_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (s_stream_task != NULL) {
+        ESP_LOGW(TAG, "[STREAM] 任务未响应，强制删除");
+        vTaskDelete(s_stream_task);
+        s_stream_task = NULL;
+    }
+
+    s_stream_cb = NULL;
+    ESP_LOGI(TAG, "[STREAM] 已停止");
+    return ESP_OK;
+}
+
+bool inmp441_is_streaming(void)
+{
+    return s_stream_running;
 }

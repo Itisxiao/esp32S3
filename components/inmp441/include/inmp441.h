@@ -89,6 +89,36 @@ esp_err_t inmp441_detect_voice(int threshold, bool *has_voice, int *volume_out);
  */
 esp_err_t inmp441_get_volume(int *volume);
 
+/* ================= 流式读取 API ================= */
+
+/**
+ * @brief  音频流数据回调函数
+ * @param  samples     int16 音频采样数据
+ * @param  frame_count 本次回调的采样帧数
+ * @param  user_ctx    用户自定义上下文指针
+ */
+typedef void (*inmp441_stream_cb_t)(const int16_t *samples, size_t frame_count, void *user_ctx);
+
+/**
+ * @brief  启动连续音频流（后台任务持续读取并回调）
+ * @param  cb        每次读取到数据后的回调函数
+ * @param  user_ctx  传递给回调的用户自定义指针（可为 NULL）
+ * @param  chunk_ms  每次回调的音频时长（毫秒），推荐 20~50
+ * @return ESP_OK 成功
+ */
+esp_err_t inmp441_start_stream(inmp441_stream_cb_t cb, void *user_ctx, uint32_t chunk_ms);
+
+/**
+ * @brief  停止音频流，等待后台任务退出
+ * @return ESP_OK 成功
+ */
+esp_err_t inmp441_stop_stream(void);
+
+/**
+ * @brief  查询音频流是否正在运行
+ */
+bool inmp441_is_streaming(void);
+
 #ifdef __cplusplus
 }
 #endif
