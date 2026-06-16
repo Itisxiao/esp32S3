@@ -17,6 +17,7 @@
 #include "enter_config.h"
 #include "inmp441.h"
 #include "key.h"
+#include "vad.h"
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -24,7 +25,7 @@
 static const char *TAG = "main";
 
 // TODO: 替换为你的后端服务器地址
-#define WS_SERVER_URI "ws://192.168.0.101:8080//ws/audio"
+#define WS_SERVER_URI "ws://192.168.0.102:8080//ws/audio"
 
 // ================= EventGroup 事件位定义 =================
 #define EVENT_NETWORK_CONNECTED   BIT0   // 获取到 IP
@@ -32,6 +33,8 @@ static const char *TAG = "main";
 #define EVENT_WS_CONNECTED        BIT2   // WebSocket 已连接
 #define EVENT_WS_DISCONNECTED     BIT3   // WebSocket 断开
 #define EVENT_TIMEOUT_TICK        BIT4   // 1秒定时心跳
+#define EVENT_VAD_START           BIT5   // VAD 检测到语音
+#define EVENT_VAD_STOP            BIT6   // VAD 确认静音
 
 // ================= 录音参数 =================
 #define RECORD_CHUNK_MS       20    // 每次发送 20ms 音频
@@ -49,16 +52,106 @@ static QueueHandle_t s_audio_queue = NULL;
 static TaskHandle_t  s_audio_sender_task = NULL;
 static volatile bool s_sender_running = false;
 
+// VAD / 手动录音模式标志
+static volatile bool s_vad_recording = false;    // VAD 正在录音
+static volatile bool s_manual_mode = false;       // 按键手动模式（优先级 > VAD）
+
 // 录音统计
 static uint32_t s_record_chunks_enqueued = 0;
 static uint32_t s_record_chunks_sent = 0;
 static uint32_t s_record_chunks_dropped = 0;
 
+// ================= 预缓冲环形缓冲区：保存最近 PREBUF_CHUNKS 个 chunk =================
+#define PREBUF_CHUNKS  15   // 15 × 20ms = 300ms 预缓冲
+static int16_t s_prebuf[PREBUF_CHUNKS * (AUDIO_CHUNK_BYTES / 2)]; // 300ms 音频
+static int     s_prebuf_head  = 0;   // 下一个写入位置
+static int     s_prebuf_count = 0;   // 已存储的 chunk 数量
+
+// 预缓冲快照：VAD 触发时保存，主循环创建队列后刷入
+static int16_t s_prebuf_snapshot[PREBUF_CHUNKS * (AUDIO_CHUNK_BYTES / 2)];
+static volatile int s_prebuf_flush_count = 0;  // 需要刷入的 chunk 数量
+
+// 前向声明
+static void audio_sender_task(void *arg);
+
+// ================= 录音控制函数（抽取为独立函数） =================
+
+/**
+ * @brief 开始录音：发送 start 消息、创建队列和发送任务
+ * @note I2S 流始终运行，此函数只负责建立发送通道
+ */
+static void start_recording(void)
+{
+    if (!ws_client_is_connected()) {
+        ESP_LOGW(TAG, "[REC] WS 未连接，无法开始录音");
+        return;
+    }
+
+    // 发送 start 消息
+    lcd_st7789_show_text("Listening...");
+    const char *start_msg = "{\"action\":\"start\"}";
+    ws_client_send(start_msg, strlen(start_msg));
+
+    // 重置统计
+    s_record_chunks_enqueued = 0;
+    s_record_chunks_sent = 0;
+    s_record_chunks_dropped = 0;
+
+    // 创建音频队列和发送任务
+    if (!s_audio_queue) {
+        s_audio_queue = xQueueCreate(AUDIO_QUEUE_LEN, AUDIO_CHUNK_BYTES);
+    }
+    if (s_audio_queue && !s_audio_sender_task) {
+        s_sender_running = true;
+        xTaskCreate(audio_sender_task, "audio_send", 4096, NULL, 6, &s_audio_sender_task);
+    }
+
+    ESP_LOGI(TAG, "[REC] 录音已开始");
+}
+
+/**
+ * @brief 停止录音：停止发送任务、排空队列、发送 stop 消息、清理
+ * @note 不停止 I2S 流（VAD 需要持续监听）
+ */
+static void stop_recording(void)
+{
+    // 1. 等待发送任务排空队列（最多 2 秒）
+    if (s_sender_running) {
+        s_sender_running = false;
+        for (int i = 0; i < 200 && s_audio_sender_task != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    // 2. 发送 stop 消息（此时所有音频数据已发送完毕）
+    if (ws_client_is_connected()) {
+        const char *stop_msg = "{\"action\":\"stop\"}";
+        ws_client_send(stop_msg, strlen(stop_msg));
+    }
+
+    // 3. 打印录音统计
+    ESP_LOGI(TAG, "[REC] 统计: 入队=%lu, 发送=%lu, 丢弃=%lu, 约 %.1f 秒",
+             (unsigned long)s_record_chunks_enqueued,
+             (unsigned long)s_record_chunks_sent,
+             (unsigned long)s_record_chunks_dropped,
+             s_record_chunks_sent * RECORD_CHUNK_MS / 1000.0f);
+
+    // 4. 清理队列
+    if (s_audio_queue) {
+        vQueueDelete(s_audio_queue);
+        s_audio_queue = NULL;
+    }
+
+    s_vad_recording = false;
+
+    if (s_lcd_ok) lcd_st7789_show_text("Standby");
+    ESP_LOGI(TAG, "[REC] 录音已停止");
+}
+
+// ================= 音频发送任务 =================
+
 /**
  * @brief 独立的 WebSocket 音频发送任务
- *
- * 从队列中取出音频数据并通过 WebSocket 发送。
- * 即使 WebSocket 发送阻塞，也不影响 I2S 流式任务的读取。
  */
 static void audio_sender_task(void *arg)
 {
@@ -89,17 +182,48 @@ static void audio_sender_task(void *arg)
         }
     }
 
-    free(buf);
+    heap_caps_free(buf);
     ESP_LOGI(TAG, "[SENDER] 音频发送任务退出, 已发送 %lu chunks",
              (unsigned long)s_record_chunks_sent);
     s_audio_sender_task = NULL;
     vTaskDelete(NULL);
 }
 
-// ================= 音频流回调：仅入队，不阻塞 =================
+// ================= 音频流回调：VAD 分析 + 预缓冲 + 入队 =================
+static uint32_t s_debug_frame_count = 0;  // 调试用：帧计数器
+static vad_state_t s_prev_vad_state = VAD_STATE_IDLE;  // 上一帧的 VAD 状态
+
 static void audio_stream_callback(const int16_t *samples, size_t frame_count, void *user_ctx)
 {
-    if (s_audio_queue && s_sender_running) {
+    // 1. 始终进行 VAD 分析
+    vad_process(samples, frame_count);
+    vad_state_t cur_state = vad_get_state();
+
+    // 2. 检测 VAD 刚触发 (IDLE → LISTENING)：保存预缓冲快照
+    if (cur_state == VAD_STATE_LISTENING && s_prev_vad_state == VAD_STATE_IDLE) {
+        int count = s_prebuf_count < PREBUF_CHUNKS ? s_prebuf_count : PREBUF_CHUNKS;
+        int start = (s_prebuf_head - count + PREBUF_CHUNKS) % PREBUF_CHUNKS;
+        for (int i = 0; i < count; i++) {
+            int idx = (start + i) % PREBUF_CHUNKS;
+            memcpy(&s_prebuf_snapshot[i * (AUDIO_CHUNK_BYTES / 2)],
+                   &s_prebuf[idx * (AUDIO_CHUNK_BYTES / 2)],
+                   AUDIO_CHUNK_BYTES);
+        }
+        s_prebuf_flush_count = count;
+        ESP_LOGI(TAG, "[PREBUF] 快照已保存, %d chunks (%dms)", count, count * 20);
+    }
+    s_prev_vad_state = cur_state;
+
+    // 3. 非录音状态：存入预缓冲环形缓冲区
+    if (!s_vad_recording && !s_manual_mode) {
+        memcpy(&s_prebuf[s_prebuf_head * (AUDIO_CHUNK_BYTES / 2)],
+               samples, AUDIO_CHUNK_BYTES);
+        s_prebuf_head = (s_prebuf_head + 1) % PREBUF_CHUNKS;
+        if (s_prebuf_count < PREBUF_CHUNKS) s_prebuf_count++;
+    }
+
+    // 4. 录音状态：入队发送
+    if ((s_vad_recording || s_manual_mode) && s_audio_queue && s_sender_running) {
         if (xQueueSend(s_audio_queue, samples, 0) != pdTRUE) {
             s_record_chunks_dropped++;
             if (s_record_chunks_dropped <= 5 || (s_record_chunks_dropped % 50 == 0)) {
@@ -110,75 +234,72 @@ static void audio_stream_callback(const int16_t *samples, size_t frame_count, vo
             s_record_chunks_enqueued++;
         }
     }
+
+    // 5. 调试日志
+    s_debug_frame_count++;
+    if (s_debug_frame_count % 50 == 0) {
+        int vol = vad_get_volume();
+        const char *state_str = "IDLE";
+        switch (cur_state) {
+            case VAD_STATE_LISTENING: state_str = "LISTENING"; break;
+            case VAD_STATE_ENDING:    state_str = "ENDING";    break;
+            default: break;
+        }
+        ESP_LOGI(TAG, "[DEBUG] vol=%d, vad=%s, recording=%d", vol, state_str, (int)s_vad_recording);
+    }
 }
 
-// ================= 按键事件回调（由消抖任务调用，可安全使用阻塞 API） =================
+// ================= VAD 事件回调：仅设置 EventGroup bit =================
+static void on_vad_event(vad_event_t event, int volume, void *user_ctx)
+{
+    if (event == VAD_EVENT_START) {
+        ESP_LOGI(TAG, "[VAD-EVENT] START, volume=%d", volume);
+        xEventGroupSetBits(s_event_group, EVENT_VAD_START);
+    } else {
+        ESP_LOGI(TAG, "[VAD-EVENT] STOP, volume=%d", volume);
+        xEventGroupSetBits(s_event_group, EVENT_VAD_STOP);
+    }
+}
+
+// ================= 按键事件回调：手动模式（优先级 > VAD） =================
 static void on_key_event(key_event_t event, void *user_ctx)
 {
     if (event == KEY_EVENT_PRESSED) {
-        ESP_LOGI(TAG, "[KEY] 按下事件");
+        ESP_LOGI(TAG, "[KEY] 按下事件 (手动录音)");
+
+        // 暂停 VAD，进入手动模式
+        vad_set_enabled(false);
+
+        // 如果 VAD 正在录音，先停掉
+        if (s_vad_recording) {
+            stop_recording();
+            vad_force_stop();
+        }
+
+        s_manual_mode = true;
 
         if (ws_client_is_connected()) {
-            lcd_st7789_show_text("Recording...");
-            const char *start_msg = "{\"action\":\"start\"}";
-            ws_client_send(start_msg, strlen(start_msg));
-
             if (!inmp441_is_streaming()) {
-                // 重置统计
-                s_record_chunks_enqueued = 0;
-                s_record_chunks_sent = 0;
-                s_record_chunks_dropped = 0;
-
-                // 创建音频队列和发送任务
-                if (!s_audio_queue) {
-                    s_audio_queue = xQueueCreate(AUDIO_QUEUE_LEN, AUDIO_CHUNK_BYTES);
-                }
-                if (s_audio_queue && !s_audio_sender_task) {
-                    s_sender_running = true;
-                    xTaskCreate(audio_sender_task, "audio_send", 4096, NULL, 6, &s_audio_sender_task);
-                }
-
                 inmp441_start_stream(audio_stream_callback, NULL, RECORD_CHUNK_MS);
             }
+            start_recording();
         } else {
             lcd_st7789_show_text("WS Disconnected");
             ESP_LOGW(TAG, "[KEY] WS 未连接，忽略录音请求");
+            s_manual_mode = false;
+            vad_set_enabled(true);
         }
     }
     else if (event == KEY_EVENT_RELEASED) {
         ESP_LOGI(TAG, "[KEY] 松开事件");
 
-        // 1. 先停止 I2S 流式读取
-        if (inmp441_is_streaming()) {
-            inmp441_stop_stream();
-        }
+        if (s_manual_mode) {
+            stop_recording();
+            s_manual_mode = false;
 
-        // 2. 等待发送任务排空队列（最多 2 秒）
-        if (s_sender_running) {
-            s_sender_running = false;
-            // 等待发送任务退出（它会先排空队列再退出）
-            for (int i = 0; i < 200 && s_audio_sender_task != NULL; i++) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-        }
-
-        // 3. 发送 stop 消息（此时所有音频数据已发送完毕）
-        if (ws_client_is_connected()) {
-            const char *stop_msg = "{\"action\":\"stop\"}";
-            ws_client_send(stop_msg, strlen(stop_msg));
-        }
-        lcd_st7789_show_text("WS Connecting");
-        // 4. 打印录音统计
-        ESP_LOGI(TAG, "[RECORD] 统计: 入队=%lu, 发送=%lu, 丢弃=%lu, 约 %.1f 秒",
-                 (unsigned long)s_record_chunks_enqueued,
-                 (unsigned long)s_record_chunks_sent,
-                 (unsigned long)s_record_chunks_dropped,
-                 s_record_chunks_sent * RECORD_CHUNK_MS / 1000.0f);
-
-        // 5. 清理队列
-        if (s_audio_queue) {
-            vQueueDelete(s_audio_queue);
-            s_audio_queue = NULL;
+            // 冷却期后恢复 VAD
+            vTaskDelay(pdMS_TO_TICKS(500));
+            vad_set_enabled(true);
         }
     }
 }
@@ -270,7 +391,6 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Step 4: Init Speaker...");
     bool speaker_ok = (max98357a_init() == ESP_OK);
     if (speaker_ok) {
-        //max98357a_play_tone(1000, 120, 3000);
         max98357a_play_wav(enter_config_wav, enter_config_wav_len);
     }
     ESP_LOGI(TAG, "Step 4: Speaker %s", speaker_ok ? "OK" : "FAILED");
@@ -294,6 +414,15 @@ extern "C" void app_main(void) {
         }
     }
 
+    // 初始化 VAD（使用默认参数）
+    vad_init(NULL, on_vad_event, NULL);
+
+    // I2S 初始化后立即启动持续流式采集（VAD 需要持续监听）
+    if (mic_ok) {
+        inmp441_start_stream(audio_stream_callback, NULL, RECORD_CHUNK_MS);
+        ESP_LOGI(TAG, "Step 4.5: I2S 持续流已启动（VAD 监听模式）");
+    }
+
     ESP_LOGI(TAG, "Step 4.6: Init Key...");
     key_init();
     key_set_callback(on_key_event, NULL);
@@ -311,7 +440,7 @@ extern "C" void app_main(void) {
              lcd_ok ? "OK" : "FAILED",
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     if (lcd_ok) {
-        lcd_st7789_show_text("Booting");
+        lcd_st7789_show_text("Standby");
     }
     s_lcd_ok = lcd_ok;
 
@@ -337,13 +466,14 @@ extern "C" void app_main(void) {
     }
 
     // ================= EventGroup 驱动的主循环 =================
-    // 所有业务逻辑集中在此，回调仅负责设置 bit
     const EventBits_t ALL_EVENTS =
         EVENT_NETWORK_CONNECTED |
         EVENT_NETWORK_DISCONNECTED |
         EVENT_WS_CONNECTED |
         EVENT_WS_DISCONNECTED |
-        EVENT_TIMEOUT_TICK;
+        EVENT_TIMEOUT_TICK |
+        EVENT_VAD_START |
+        EVENT_VAD_STOP;
 
     int timeout_counter = 0;
 
@@ -396,11 +526,14 @@ extern "C" void app_main(void) {
         // ---------- WebSocket 断开 ----------
         if (bits & EVENT_WS_DISCONNECTED) {
             ESP_LOGW(TAG, "[WS] 与后端服务器断开");
-            // 如果正在录音，强制停止
-            if (inmp441_is_streaming()) {
-                inmp441_stop_stream();
-            }
-            // 停止发送任务
+
+            // 如果正在录音（VAD 或手动），强制停止
+            vad_force_stop();
+            s_vad_recording = false;
+            s_manual_mode = false;
+            vad_set_enabled(true);  // 恢复 VAD 监听
+
+            // 停止发送任务（但不停止 I2S 流，VAD 需要持续监听）
             if (s_sender_running) {
                 s_sender_running = false;
                 for (int i = 0; i < 50 && s_audio_sender_task != NULL; i++) {
@@ -411,19 +544,57 @@ extern "C" void app_main(void) {
                 vQueueDelete(s_audio_queue);
                 s_audio_queue = NULL;
             }
-            if (s_lcd_ok) lcd_st7789_set_status_text("ONLINE");
+            if (s_lcd_ok) {
+                lcd_st7789_set_status_text("ONLINE");
+                lcd_st7789_show_text("Standby");
+            }
+        }
+
+        // ---------- VAD 检测到语音 ----------
+        if (bits & EVENT_VAD_START) {
+            if (s_manual_mode) {
+                // 手动模式优先，忽略 VAD 触发
+            } else if (!ws_client_is_connected()) {
+                ESP_LOGW(TAG, "[VAD] WS 未连接，忽略语音触发");
+                vad_force_stop();
+                if (s_lcd_ok) lcd_st7789_show_text("WS not ready");
+            } else {
+                ESP_LOGI(TAG, "[VAD] 检测到语音，开始录音");
+                s_vad_recording = true;
+                start_recording();
+
+                // 刷入预缓冲快照（VAD 触发前 300ms 的音频）
+                if (s_prebuf_flush_count > 0 && s_audio_queue) {
+                    int count = s_prebuf_flush_count;
+                    for (int i = 0; i < count; i++) {
+                        xQueueSend(s_audio_queue,
+                                   &s_prebuf_snapshot[i * (AUDIO_CHUNK_BYTES / 2)],
+                                   0);
+                        s_record_chunks_enqueued++;
+                    }
+                    ESP_LOGI(TAG, "[PREBUF] 已刷入 %d chunks 预缓冲", count);
+                    s_prebuf_flush_count = 0;
+                }
+            }
+        }
+
+        // ---------- VAD 确认静音 ----------
+        if (bits & EVENT_VAD_STOP) {
+            if (s_vad_recording && !s_manual_mode) {
+                ESP_LOGI(TAG, "[VAD] 确认静音，停止录音");
+                stop_recording();
+            }
         }
 
         // ---------- 1秒心跳：连接超时回退 AP ----------
         if (bits & EVENT_TIMEOUT_TICK) {
             if (!wifi_manager.IsConnected() && !wifi_manager.IsConfigMode()) {
-                // 配网完成后退出 AP 模式，但 Station 未启动 —— 立即启动 Station
                 auto& ssid_list = SsidManager::GetInstance().GetSsidList();
                 if (!ssid_list.empty() && timeout_counter == 0) {
                     ESP_LOGI(TAG, "配网完成，启动 Station 模式连接已保存的 WiFi");
                     wifi_manager.StartStation();
                     if (s_lcd_ok) lcd_st7789_show_text("Connecting...");
-                    timeout_counter = 1;  // 避免重复触发
+                    timeout_counter = 1;
                     continue;
                 }
 

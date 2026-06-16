@@ -143,9 +143,9 @@ esp_err_t inmp441_read(int16_t *samples, size_t frame_count,
 
         size_t frames_this_read = bytes_read / sizeof(int32_t);
         for (size_t i = 0; i < frames_this_read; i++) {
-            /* INMP441 数据在高 24 位, 右移 14 位转为 16bit 有效数据 */
+            /* INMP441 24bit 数据在高 24 位, 右移 16 位正确映射到 16bit 范围 */
             int32_t raw = s_raw_buf[i];
-            samples[total_read + i] = (int16_t)(raw >> 14);
+            samples[total_read + i] = (int16_t)(raw >> 16);
         }
 
         total_read += frames_this_read;
@@ -292,9 +292,9 @@ static void stream_task(void *arg)
 
         /* 累积够一个完整 chunk 后回调 */
         if (offset >= chunk_frames) {
-            /* 32bit -> 16bit 转换 */
+            /* 32bit -> 16bit 转换: INMP441 24bit 数据在高 24 位, >> 16 正确映射到 16bit 范围 */
             for (uint32_t i = 0; i < chunk_frames; i++) {
-                pcm_buf[i] = (int16_t)(raw_buf[i] >> 14);
+                pcm_buf[i] = (int16_t)(raw_buf[i] >> 16);
             }
 
             total_chunks++;
