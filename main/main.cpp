@@ -119,6 +119,7 @@ static void on_key_event(key_event_t event, void *user_ctx)
         ESP_LOGI(TAG, "[KEY] 按下事件");
 
         if (ws_client_is_connected()) {
+            lcd_st7789_show_text("Recording...");
             const char *start_msg = "{\"action\":\"start\"}";
             ws_client_send(start_msg, strlen(start_msg));
 
@@ -140,6 +141,7 @@ static void on_key_event(key_event_t event, void *user_ctx)
                 inmp441_start_stream(audio_stream_callback, NULL, RECORD_CHUNK_MS);
             }
         } else {
+            lcd_st7789_show_text("WS Disconnected");
             ESP_LOGW(TAG, "[KEY] WS 未连接，忽略录音请求");
         }
     }
@@ -165,7 +167,7 @@ static void on_key_event(key_event_t event, void *user_ctx)
             const char *stop_msg = "{\"action\":\"stop\"}";
             ws_client_send(stop_msg, strlen(stop_msg));
         }
-
+        lcd_st7789_show_text("WS Connecting");
         // 4. 打印录音统计
         ESP_LOGI(TAG, "[RECORD] 统计: 入队=%lu, 发送=%lu, 丢弃=%lu, 约 %.1f 秒",
                  (unsigned long)s_record_chunks_enqueued,
