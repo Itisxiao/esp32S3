@@ -66,7 +66,9 @@ static uint32_t s_record_chunks_dropped = 0;
 // 服务端参数：50ms/chunk, 1600 bytes/chunk (16kHz × 16bit × mono × 50ms)
 #define PLAYBACK_CHUNK_BYTES   1600   // 每个 chunk 的字节数
 #define PLAYBACK_BUF_CHUNKS    12     // 环形缓冲区深度：12 × 50ms = 600ms（吸收网络抖动）
-#define PLAYBACK_PREBUF_CHUNKS 4      // 预缓冲阈值：攒满 4 chunk (200ms) 后再启动播放
+#define PLAYBACK_PREBUF_CHUNKS 6      // 预缓冲阈值：攒满 6 chunk (300ms) 后再启动播放
+#define PLAYBACK_VOLUME_SHIFT  4      // 音量衰减：0=原始, 1=-6dB, 2=-12dB, 3=-18dB, 4=-24dB
+#define PLAYBACK_SILENCE_TIMEOUT_MS  2000  // 连续静音超时自动停止 (ms)
 #define PLAYBACK_BUF_BYTES     (PLAYBACK_CHUNK_BYTES * PLAYBACK_BUF_CHUNKS)
 
 static uint8_t  s_playback_buf[PLAYBACK_BUF_BYTES];  // 环形缓冲区（PSRAM 友好）
@@ -229,6 +231,8 @@ static void playback_task(void *arg)
 
     // 每个 chunk 的音频时长：800 样本 @ 16kHz = 50ms
     const TickType_t chunk_ticks = pdMS_TO_TICKS(50);
+    const int silence_limit = PLAYBACK_SILENCE_TIMEOUT_MS / 50; // 连续静音次数上限
+    int consecutive_silence = 0;
 
     ESP_LOGI(TAG, "[PLAYBACK] 播放任务启动 (chunk=%d bytes, buf=%d chunks)",
              PLAYBACK_CHUNK_BYTES, PLAYBACK_BUF_CHUNKS);
@@ -241,12 +245,23 @@ static void playback_task(void *arg)
             // 超时：缓冲区空，填充静音避免 I2S underrun
             max98357a_write(silence_chunk, PLAYBACK_CHUNK_BYTES / 2, 100);
             s_pb_underruns++;
-            if (s_pb_underruns <= 3 || (s_pb_underruns % 20 == 0)) {
+            consecutive_silence++;
+            if (consecutive_silence <= 3 || (consecutive_silence % 20 == 0)) {
                 ESP_LOGW(TAG, "[PLAYBACK] 缓冲区空, 静音填充 (累计 %lu 次)",
                          (unsigned long)s_pb_underruns);
             }
+            // 服务端播放完毕，连续静音超时自动停止
+            if (consecutive_silence >= silence_limit) {
+                ESP_LOGI(TAG, "[PLAYBACK] 服务端播放完毕, 连续静音 %d 次, 自动停止",
+                         consecutive_silence);
+                s_playback_running = false;
+                break;
+            }
             continue;
         }
+
+        // 收到新数据，重置静音计数
+        consecutive_silence = 0;
 
         // 从环形缓冲区读取一个 chunk
         int read_idx;
@@ -261,7 +276,13 @@ static void playback_task(void *arg)
         taskEXIT_CRITICAL(&s_pb_lock);
 
         if (read_idx >= 0) {
-            const int16_t *samples = (const int16_t *)&s_playback_buf[read_idx * PLAYBACK_CHUNK_BYTES];
+            int16_t *samples = (int16_t *)&s_playback_buf[read_idx * PLAYBACK_CHUNK_BYTES];
+            // 软件音量衰减：右移 PLAYBACK_VOLUME_SHIFT 位
+#if PLAYBACK_VOLUME_SHIFT > 0
+            for (int i = 0; i < PLAYBACK_CHUNK_BYTES / 2; i++) {
+                samples[i] >>= PLAYBACK_VOLUME_SHIFT;
+            }
+#endif
             max98357a_write(samples, PLAYBACK_CHUNK_BYTES / 2, 100);
             s_pb_chunks_played++;
 
@@ -314,18 +335,22 @@ static void playback_start(void)
  */
 static void playback_stop(void)
 {
-    if (!s_playback_running) return;
+    // 任务已自动退出且无信号量残留，直接返回
+    if (!s_playback_running && s_playback_task == NULL && s_pb_sem == NULL) return;
 
     s_playback_running = false;
     s_pb_prebuf_done = false;
-    // 唤醒播放任务（如果它在等信号量）
-    if (s_pb_sem) {
+    // 唤醒播放任务（如果它还在等信号量）
+    if (s_pb_sem && s_playback_task != NULL) {
         xSemaphoreGive(s_pb_sem);
     }
     // 等待任务退出
-    for (int i = 0; i < 100 && s_playback_task != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_playback_task != NULL) {
+        for (int i = 0; i < 100 && s_playback_task != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
+    // 清理信号量
     if (s_pb_sem) {
         vSemaphoreDelete(s_pb_sem);
         s_pb_sem = NULL;
