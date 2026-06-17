@@ -2,13 +2,20 @@
 #include "esp_websocket_client.h"
 #include "esp_log.h"
 #include <string.h>
+#include <stdlib.h>
 
 static const char *TAG = "ws_client";
+
+// 分片重组缓冲区（用于拼接被拆分的 WebSocket 消息）
+#define WS_REASSEMBLY_BUF_SIZE 4096
+static uint8_t *ws_reassembly_buf = NULL;
+static int ws_reassembly_offset = 0;
 
 static esp_websocket_client_handle_t ws_client = NULL;
 static bool ws_connected = false;
 static ws_status_cb_t user_status_cb = NULL;
 static ws_message_cb_t user_message_cb = NULL;
+static ws_binary_cb_t user_binary_cb = NULL;
 
 // ================= WebSocket 事件处理 =================
 
@@ -30,15 +37,57 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
             if (user_status_cb) user_status_cb(false);
             break;
 
-        case WEBSOCKET_EVENT_DATA:
-            if (data->op_code == 0x01 || data->op_code == 0x02) {
-                // 文本帧(0x01) 或 二进制帧(0x02)
-                ESP_LOGI(TAG, "收到消息, len=%d, op_code=0x%02x", data->data_len, data->op_code);
-                if (user_message_cb && data->data_ptr && data->data_len > 0) {
-                    user_message_cb((const char *)data->data_ptr, data->data_len);
+        case WEBSOCKET_EVENT_DATA: {
+            uint8_t op = data->op_code;
+            int payload_len = data->payload_len;
+            int payload_offset = data->payload_offset;
+            int data_len = data->data_len;
+
+            // 文本帧（非分片）：直接分发
+            if (op == 0x01) {
+                ESP_LOGI(TAG, "收到文本消息, len=%d", data_len);
+                if (user_message_cb && data->data_ptr && data_len > 0) {
+                    user_message_cb((const char *)data->data_ptr, data_len);
+                }
+                break;
+            }
+
+            // 二进制帧 (0x02) 或续帧 (0x00)：分片重组后分发
+            if (op == 0x02 || op == 0x00) {
+                ESP_LOGI(TAG, "[WS] 二进制事件: op=0x%02x, data_len=%d, payload_len=%d, offset=%d",
+                         op, data_len, payload_len, payload_offset);
+
+                if (payload_len > WS_REASSEMBLY_BUF_SIZE) {
+                    ESP_LOGW(TAG, "消息过大 %d > %d, 丢弃", payload_len, WS_REASSEMBLY_BUF_SIZE);
+                    ws_reassembly_offset = 0;
+                    break;
+                }
+
+                // payload_offset==0 表示新消息起始（不能靠 op_code 判断，
+                // 因为 esp_websocket_client 在分片读取时每个事件都携带原始 op_code）
+                if (payload_offset == 0) {
+                    ws_reassembly_offset = 0;
+                }
+
+                // 拷贝当前分片到重组缓冲区
+                if (data->data_ptr && data_len > 0 &&
+                    ws_reassembly_offset + data_len <= WS_REASSEMBLY_BUF_SIZE) {
+                    memcpy(ws_reassembly_buf + ws_reassembly_offset,
+                           data->data_ptr, data_len);
+                    ws_reassembly_offset += data_len;
+                }
+
+                // 接收完整个消息，分发
+                if (payload_offset + data_len >= payload_len) {
+                    ESP_LOGI(TAG, "[WS] 重组完成, 总长度=%d", ws_reassembly_offset);
+                    if (user_binary_cb && ws_reassembly_offset > 0) {
+                        user_binary_cb(ws_reassembly_buf, ws_reassembly_offset);
+                    }
+                    ws_reassembly_offset = 0;
                 }
             }
             break;
+        }
 
         case WEBSOCKET_EVENT_ERROR:
             ESP_LOGE(TAG, "WebSocket 错误");
@@ -53,7 +102,8 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
 
 // ================= 公共接口 =================
 
-esp_err_t ws_client_init(const char *uri, ws_status_cb_t status_cb, ws_message_cb_t msg_cb)
+esp_err_t ws_client_init(const char *uri, ws_status_cb_t status_cb,
+                         ws_message_cb_t msg_cb, ws_binary_cb_t bin_cb)
 {
     if (uri == NULL) {
         ESP_LOGE(TAG, "URI 不能为空");
@@ -67,12 +117,24 @@ esp_err_t ws_client_init(const char *uri, ws_status_cb_t status_cb, ws_message_c
 
     user_status_cb = status_cb;
     user_message_cb = msg_cb;
+    user_binary_cb = bin_cb;
     ws_connected = false;
+
+    // 分配分片重组缓冲区
+    if (ws_reassembly_buf == NULL) {
+        ws_reassembly_buf = malloc(WS_REASSEMBLY_BUF_SIZE);
+        if (ws_reassembly_buf == NULL) {
+            ESP_LOGE(TAG, "分片重组缓冲区分配失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ws_reassembly_offset = 0;
 
     esp_websocket_client_config_t ws_cfg = {
         .uri = uri,
         .reconnect_timeout_ms = 5000,  // 断线自动重连，间隔 5 秒
         .network_timeout_ms = 10000,   // 网络超时 10 秒
+        .buffer_size = 4096,           // 增大缓冲区，减少分片
     };
 
     ws_client = esp_websocket_client_init(&ws_cfg);
@@ -160,6 +222,14 @@ esp_err_t ws_client_stop(void)
     ws_client = NULL;
     user_status_cb = NULL;
     user_message_cb = NULL;
+    user_binary_cb = NULL;
+
+    // 释放分片重组缓冲区
+    if (ws_reassembly_buf) {
+        free(ws_reassembly_buf);
+        ws_reassembly_buf = NULL;
+    }
+    ws_reassembly_offset = 0;
 
     ESP_LOGI(TAG, "WebSocket 客户端已停止");
     return ESP_OK;
