@@ -8,7 +8,9 @@
 static const char *TAG = "vad";
 
 // ===== 默认参数 =====
-#define DEFAULT_VOICE_THRESHOLD    2000    // 有声阈值 (大幅提高, 仅大声触发)
+//TODO
+//调整阈值 不录制声音
+#define DEFAULT_VOICE_THRESHOLD    5000    // 有声阈值 (大幅提高, 仅大声触发)
 #define DEFAULT_SILENCE_THRESHOLD  250     // 静音阈值 (降低, 更容易检测静音)
 #define DEFAULT_START_FRAMES       8       // 160ms @20ms/chunk, 更长确认时间
 #define DEFAULT_SILENCE_FRAMES     35      // 700ms
