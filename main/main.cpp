@@ -2,7 +2,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
+#include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_netif.h"
@@ -26,7 +26,7 @@
 static const char *TAG = "main";
 
 // TODO: 替换为你的后端服务器地址
-#define WS_SERVER_URI "ws://192.168.0.102:8080//ws/audio"
+#define WS_SERVER_URI "ws://192.168.0.100:8080//ws/audio"
 
 // ================= EventGroup 事件位定义 =================
 #define EVENT_NETWORK_CONNECTED   BIT0   // 获取到 IP
@@ -65,21 +65,16 @@ static uint32_t s_record_chunks_dropped = 0;
 // ================= PCM 播放环形缓冲区（接收服务端下发的音频） =================
 // 服务端参数：50ms/chunk, 1600 bytes/chunk (16kHz × 16bit × mono × 50ms)
 #define PLAYBACK_CHUNK_BYTES   1600   // 每个 chunk 的字节数
-#define PLAYBACK_BUF_CHUNKS    12     // 环形缓冲区深度：12 × 50ms = 600ms（吸收网络抖动）
-#define PLAYBACK_PREBUF_CHUNKS 6      // 预缓冲阈值：攒满 6 chunk (300ms) 后再启动播放
+#define PLAYBACK_BUF_CHUNKS    60     // 环形缓冲区深度：60 × 50ms = 3000ms（吸收网络抖动）
+#define PLAYBACK_PREBUF_CHUNKS 20      // 预缓冲阈值：攒满 20 chunk (1000ms) 后再启动播放
 #define PLAYBACK_VOLUME_SHIFT  4      // 音量衰减：0=原始, 1=-6dB, 2=-12dB, 3=-18dB, 4=-24dB
 #define PLAYBACK_SILENCE_TIMEOUT_MS  2000  // 连续静音超时自动停止 (ms)
-#define PLAYBACK_BUF_BYTES     (PLAYBACK_CHUNK_BYTES * PLAYBACK_BUF_CHUNKS)
+// NOSPLIT 环形缓冲区：每项 = chunk + 内部头开销，多留余量
+#define PLAYBACK_RINGBUF_SIZE  ((PLAYBACK_CHUNK_BYTES + 16) * PLAYBACK_BUF_CHUNKS)
 
-static uint8_t  s_playback_buf[PLAYBACK_BUF_BYTES];  // 环形缓冲区（PSRAM 友好）
-static volatile int s_pb_write_idx = 0;   // 写指针（chunk 索引）
-static volatile int s_pb_read_idx  = 0;   // 读指针（chunk 索引）
-static volatile int s_pb_count     = 0;   // 当前已缓冲的 chunk 数量
-static SemaphoreHandle_t s_pb_sem  = NULL; // 播放任务等待信号量
-static portMUX_TYPE s_pb_lock = portMUX_INITIALIZER_UNLOCKED; // 环形缓冲区自旋锁（SMP 安全）
+static RingbufHandle_t s_pb_ringbuf = NULL; // FreeRTOS 环形缓冲区（SMP 安全，自带阻塞等待）
 static TaskHandle_t  s_playback_task = NULL;
 static volatile bool s_playback_running = false;
-static volatile bool s_pb_prebuf_done = false; // 预缓冲是否已完成
 
 // 播放统计
 static uint32_t s_pb_chunks_received = 0;
@@ -218,30 +213,34 @@ static void audio_sender_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ================= PCM 播放任务：从环形缓冲区取数据送入 I2S =================
+// ================= PCM 播放任务：从 RingBuf 取数据送入 I2S =================
 
 /**
- * @brief PCM 播放任务：持续从环形缓冲区读取 chunk 并写入 I2S
- *        缓冲区空时填充静音，防止 I2S DMA underrun 导致爆音
+ * @brief PCM 播放任务：持续从 RingBuf 读取 chunk 并写入 I2S
+ *        使用 xRingbufferReceive 阻塞等待，超时则填充静音防止 I2S underrun
  */
 static void playback_task(void *arg)
 {
     static int16_t silence_chunk[PLAYBACK_CHUNK_BYTES / 2]; // 全零静音帧
     memset(silence_chunk, 0, sizeof(silence_chunk));
 
-    // 每个 chunk 的音频时长：800 样本 @ 16kHz = 50ms
-    const TickType_t chunk_ticks = pdMS_TO_TICKS(50);
-    const int silence_limit = PLAYBACK_SILENCE_TIMEOUT_MS / 50; // 连续静音次数上限
+    int16_t chunk_buf[PLAYBACK_CHUNK_BYTES / 2]; // 从 ringbuf 拷贝后做音量衰减
+    const TickType_t chunk_ticks = pdMS_TO_TICKS(50); // 每个 chunk 50ms
+    const int silence_limit = PLAYBACK_SILENCE_TIMEOUT_MS / 50;
     int consecutive_silence = 0;
 
-    ESP_LOGI(TAG, "[PLAYBACK] 播放任务启动 (chunk=%d bytes, buf=%d chunks)",
+    ESP_LOGI(TAG, "[PLAYBACK] 播放任务启动 (chunk=%d bytes, ringbuf=%d chunks)",
              PLAYBACK_CHUNK_BYTES, PLAYBACK_BUF_CHUNKS);
 
     while (s_playback_running) {
         TickType_t iter_start = xTaskGetTickCount();
 
-        // 等待数据，最多等一个 chunk 时间 (50ms)
-        if (xSemaphoreTake(s_pb_sem, chunk_ticks) != pdTRUE) {
+        // 阻塞等待数据，最多等一个 chunk 时间 (50ms)
+        // ringbuf 内部处理 SMP 安全，无需 spinlock
+        size_t item_size = 0;
+        const void *item = xRingbufferReceive(s_pb_ringbuf, &item_size, chunk_ticks);
+
+        if (item == NULL) {
             // 超时：缓冲区空，填充静音避免 I2S underrun
             max98357a_write(silence_chunk, PLAYBACK_CHUNK_BYTES / 2, 100);
             s_pb_underruns++;
@@ -250,7 +249,6 @@ static void playback_task(void *arg)
                 ESP_LOGW(TAG, "[PLAYBACK] 缓冲区空, 静音填充 (累计 %lu 次)",
                          (unsigned long)s_pb_underruns);
             }
-            // 服务端播放完毕，连续静音超时自动停止
             if (consecutive_silence >= silence_limit) {
                 ESP_LOGI(TAG, "[PLAYBACK] 服务端播放完毕, 连续静音 %d 次, 自动停止",
                          consecutive_silence);
@@ -263,35 +261,22 @@ static void playback_task(void *arg)
         // 收到新数据，重置静音计数
         consecutive_silence = 0;
 
-        // 从环形缓冲区读取一个 chunk
-        int read_idx;
-        taskENTER_CRITICAL(&s_pb_lock);
-        if (s_pb_count > 0) {
-            read_idx = s_pb_read_idx;
-            s_pb_read_idx = (s_pb_read_idx + 1) % PLAYBACK_BUF_CHUNKS;
-            s_pb_count--;
-        } else {
-            read_idx = -1;
-        }
-        taskEXIT_CRITICAL(&s_pb_lock);
+        // 拷贝到本地缓冲区后做音量衰减（ringbuf 返回的是只读指针）
+        memcpy(chunk_buf, item, PLAYBACK_CHUNK_BYTES);
+        vRingbufferReturnItem(s_pb_ringbuf, (void *)item);
 
-        if (read_idx >= 0) {
-            int16_t *samples = (int16_t *)&s_playback_buf[read_idx * PLAYBACK_CHUNK_BYTES];
-            // 软件音量衰减：右移 PLAYBACK_VOLUME_SHIFT 位
 #if PLAYBACK_VOLUME_SHIFT > 0
-            for (int i = 0; i < PLAYBACK_CHUNK_BYTES / 2; i++) {
-                samples[i] >>= PLAYBACK_VOLUME_SHIFT;
-            }
+        for (int i = 0; i < PLAYBACK_CHUNK_BYTES / 2; i++) {
+            chunk_buf[i] >>= PLAYBACK_VOLUME_SHIFT;
+        }
 #endif
-            max98357a_write(samples, PLAYBACK_CHUNK_BYTES / 2, 100);
-            s_pb_chunks_played++;
+        max98357a_write(chunk_buf, PLAYBACK_CHUNK_BYTES / 2, 100);
+        s_pb_chunks_played++;
 
-            // 速率限制：确保每次迭代耗时 >= 50ms（匹配音频实时时长）
-            // 防止 i2s_channel_write 返回过快导致缓冲区被提前耗尽
-            TickType_t elapsed = xTaskGetTickCount() - iter_start;
-            if (elapsed < chunk_ticks) {
-                vTaskDelay(chunk_ticks - elapsed);
-            }
+        // 速率限制：确保每次迭代耗时 >= 50ms（匹配音频实时时长）
+        TickType_t elapsed = xTaskGetTickCount() - iter_start;
+        if (elapsed < chunk_ticks) {
+            vTaskDelay(chunk_ticks - elapsed);
         }
     }
 
@@ -305,25 +290,23 @@ static void playback_task(void *arg)
 }
 
 /**
- * @brief 启动播放：初始化信号量，但不立即创建播放任务
- *        播放任务在预缓冲填满后由 on_ws_binary 创建
+ * @brief 启动播放：创建 RingBuf，重置统计
  */
 static void playback_start(void)
 {
     if (s_playback_running) return;
 
-    // 重置环形缓冲区
-    s_pb_write_idx = 0;
-    s_pb_read_idx  = 0;
-    s_pb_count     = 0;
-    s_pb_prebuf_done = false;
     s_pb_chunks_received = 0;
     s_pb_chunks_played   = 0;
     s_pb_overruns  = 0;
     s_pb_underruns = 0;
 
-    if (!s_pb_sem) {
-        s_pb_sem = xSemaphoreCreateCounting(PLAYBACK_BUF_CHUNKS, 0);
+    if (!s_pb_ringbuf) {
+        s_pb_ringbuf = xRingbufferCreate(PLAYBACK_RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
+        if (!s_pb_ringbuf) {
+            ESP_LOGE(TAG, "[PLAYBACK] RingBuf 创建失败");
+            return;
+        }
     }
 
     s_playback_running = true;
@@ -331,18 +314,18 @@ static void playback_start(void)
 }
 
 /**
- * @brief 停止播放：等待任务退出并清理
+ * @brief 停止播放：等待任务退出并清理 RingBuf
  */
 static void playback_stop(void)
 {
-    // 任务已自动退出且无信号量残留，直接返回
-    if (!s_playback_running && s_playback_task == NULL && s_pb_sem == NULL) return;
+    if (!s_playback_running && s_playback_task == NULL && s_pb_ringbuf == NULL) return;
 
     s_playback_running = false;
-    s_pb_prebuf_done = false;
-    // 唤醒播放任务（如果它还在等信号量）
-    if (s_pb_sem && s_playback_task != NULL) {
-        xSemaphoreGive(s_pb_sem);
+    // 唤醒播放任务（如果它还在等 ringbuf）：发送完整 chunk 大小的 dummy 防止 memcpy 越界
+    if (s_pb_ringbuf && s_playback_task != NULL) {
+        uint8_t dummy[PLAYBACK_CHUNK_BYTES];
+        memset(dummy, 0, sizeof(dummy));
+        xRingbufferSend(s_pb_ringbuf, dummy, PLAYBACK_CHUNK_BYTES, 0);
     }
     // 等待任务退出
     if (s_playback_task != NULL) {
@@ -350,17 +333,17 @@ static void playback_stop(void)
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
-    // 清理信号量
-    if (s_pb_sem) {
-        vSemaphoreDelete(s_pb_sem);
-        s_pb_sem = NULL;
+    // 清理 RingBuf
+    if (s_pb_ringbuf) {
+        vRingbufferDelete(s_pb_ringbuf);
+        s_pb_ringbuf = NULL;
     }
     ESP_LOGI(TAG, "[PLAYBACK] 播放已停止");
 }
 
 /**
- * @brief WebSocket 二进制回调：将 PCM 数据写入环形缓冲区
- *        由 websocket 事件线程调用，需尽量快速返回
+ * @brief WebSocket 二进制回调：将 PCM 数据写入 RingBuf
+ *        由 websocket 事件线程调用，ringbuf 内部处理 SMP 安全
  */
 static void on_ws_binary(const uint8_t *data, size_t len)
 {
@@ -376,45 +359,27 @@ static void on_ws_binary(const uint8_t *data, size_t len)
         playback_start();
     }
 
-    taskENTER_CRITICAL(&s_pb_lock);
-    if (s_pb_count >= PLAYBACK_BUF_CHUNKS) {
-        // 缓冲区满：丢弃最旧的数据
-        int write_pos = s_pb_write_idx;
-        memcpy(&s_playback_buf[write_pos * PLAYBACK_CHUNK_BYTES], data, len);
-        s_pb_write_idx = (s_pb_write_idx + 1) % PLAYBACK_BUF_CHUNKS;
-        s_pb_read_idx = (s_pb_read_idx + 1) % PLAYBACK_BUF_CHUNKS;
-        taskEXIT_CRITICAL(&s_pb_lock);
+    // 写入 RingBuf（SMP 安全，无需 spinlock）
+    if (xRingbufferSend(s_pb_ringbuf, data, PLAYBACK_CHUNK_BYTES, 0) != pdTRUE) {
+        // 缓冲区满：丢弃最旧数据后重试
+        size_t old_size;
+        void *old = xRingbufferReceive(s_pb_ringbuf, &old_size, 0);
+        if (old) vRingbufferReturnItem(s_pb_ringbuf, old);
+        xRingbufferSend(s_pb_ringbuf, data, PLAYBACK_CHUNK_BYTES, 0);
         s_pb_overruns++;
         if (s_pb_overruns <= 3 || (s_pb_overruns % 20 == 0)) {
             ESP_LOGW(TAG, "[PLAYBACK] 缓冲区满, 丢弃旧数据 (累计 %lu 次)",
                      (unsigned long)s_pb_overruns);
         }
-    } else {
-        int write_pos = s_pb_write_idx;
-        memcpy(&s_playback_buf[write_pos * PLAYBACK_CHUNK_BYTES], data, len);
-        s_pb_write_idx = (s_pb_write_idx + 1) % PLAYBACK_BUF_CHUNKS;
-        s_pb_count++;
-        taskEXIT_CRITICAL(&s_pb_lock);
     }
 
-    // 预缓冲阶段：攒够 PREBUF_CHUNKS 后再启动播放任务
-    if (!s_pb_prebuf_done && s_pb_count >= PLAYBACK_PREBUF_CHUNKS) {
-        s_pb_prebuf_done = true;
-        ESP_LOGI(TAG, "[PLAYBACK] 预缓冲完成 (%d chunks), 启动播放任务",
-                 s_pb_count);
-        if (!s_playback_task) {
-            xTaskCreate(playback_task, "pcm_playback", 4096, NULL, 7, &s_playback_task);
-        }
-        // 为已缓冲的 chunk 发出信号量
-        for (int i = 0; i < s_pb_count; i++) {
-            xSemaphoreGive(s_pb_sem);
-        }
-        return; // 已经批量给了信号量，不再单独给
-    }
-
-    // 预缓冲完成后，正常通知播放任务
-    if (s_pb_prebuf_done && s_pb_sem) {
-        xSemaphoreGive(s_pb_sem);
+    // 预缓冲阶段：攒够 PREBUF_CHUNKS 后启动播放任务
+    size_t free_bytes = xRingbufferGetCurFreeSize(s_pb_ringbuf);
+    size_t used_bytes = PLAYBACK_RINGBUF_SIZE - free_bytes;
+    int buffered_chunks = (int)(used_bytes / PLAYBACK_CHUNK_BYTES);
+    if (!s_playback_task && buffered_chunks >= PLAYBACK_PREBUF_CHUNKS) {
+        ESP_LOGI(TAG, "[PLAYBACK] 预缓冲完成 (~%d chunks), 启动播放任务", buffered_chunks);
+        xTaskCreate(playback_task, "pcm_playback", 4096, NULL, 7, &s_playback_task);
     }
 }
 
